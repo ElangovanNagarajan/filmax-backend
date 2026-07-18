@@ -1,0 +1,6 @@
+node_modules/
+.env
+data.json
+bms_cinema_cache.json
+event-codes.json
+*.log

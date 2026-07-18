@@ -1,0 +1,51 @@
+name: ticket-watch
+
+# Runs the self-looping watcher. Each run lasts ~5.5h then re-triggers itself
+# for continuous coverage. Also re-armed by a schedule as a safety net in case
+# a run dies, and can be started manually.
+on:
+  workflow_dispatch:
+  schedule:
+    # Safety net: relaunch every 6 hours even if a self-relaunch was missed.
+    - cron: '0 */6 * * *'
+
+concurrency:
+  # Never run two watchers at once.
+  group: ticket-watch
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # needed to re-dispatch itself
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # under the 6h hard cap
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --omit=dev
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run watcher shift
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
+          RUN_MINUTES: '330'
+          INTERVAL_SEC: '60'
+        run: node src/runner.js
+
+      - name: Relaunch next shift
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run watch.yml --ref ${{ github.ref_name }}
