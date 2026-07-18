@@ -1,6 +1,7 @@
 import { checkBMS } from './scrapers/bookmyshow.js';
 import { checkDistrict } from './scrapers/district.js';
 import { getEventCode, saveEventCode } from './event-codes.js';
+import { resolveBmsSeatUrl } from './scrapers/bms_seat_resolver.js';
 
 function movieSlug(movie) {
   return movie.toLowerCase().replace(/^(the|a|an)\s+/i, '').replace(/[^a-z0-9]+/g, '-');
@@ -122,10 +123,41 @@ export async function checkWatch(watch) {
     status = `${allCurrent.length} shows · ${open} available · ${allCurrent.length - open} sold out`;
   }
 
+  // Carry forward already-resolved seat URLs from the previous check so we
+  // don't re-run Playwright for shows we've already resolved.
+  const priorByStableSid = new Map((watch.currentSessions || []).map((s) => [`${s.date}|${s.time}`, s]));
+  for (const s of allCurrent) {
+    const prior = priorByStableSid.get(`${s.date}|${s.time}`);
+    if (prior?.resolvedSeatUrl && !s.resolvedSeatUrl) s.resolvedSeatUrl = prior.resolvedSeatUrl;
+  }
+
+  // Pre-resolve the exact BMS seat-layout URL for each unresolved, non-sold-out
+  // BMS-backed show, so the app can open it instantly on tap. Cap the work per
+  // pass so a check never runs long. district-only shows keep their bookUrl.
+  const toResolve = allCurrent
+    .filter((s) => !s.resolvedSeatUrl && !s.soldOut && s.bmsCinemaSlug && s.bmsCinemaCode)
+    .slice(0, 6);
+  for (const s of toResolve) {
+    try {
+      const url = await resolveBmsSeatUrl({
+        city: s.bmsCinemaCity, slug: s.bmsCinemaSlug, cinemaCode: s.bmsCinemaCode,
+        date: s.date, time: s.time, movieHint: watch.movie,
+      });
+      if (url) s.resolvedSeatUrl = url;
+    } catch { /* leave unresolved; app falls back to cinema date page */ }
+  }
+
   // Resolve/refresh the movie-page URL for the movie-name tap.
   const city = watch.city || 'chennai';
   let eventCode = getEventCode(watch.movie, city);
   if (!eventCode && movieUrl) { const m = movieUrl.match(/\/(ET\d{8})/); if (m) { eventCode = m[1]; saveEventCode(watch.movie, city, eventCode).catch(() => {}); } }
+  // Harvest event code from any resolved seat URL too (helps movie-name tap).
+  if (!eventCode) {
+    for (const s of allCurrent) {
+      const m = s.resolvedSeatUrl?.match(/\/(ET\d{8})/);
+      if (m) { eventCode = m[1]; saveEventCode(watch.movie, city, eventCode).catch(() => {}); break; }
+    }
+  }
   const moviePageUrl = resolveMoviePageUrl(watch, allCurrent, eventCode);
 
   const checkDurationSec = Math.round((Date.now() - runStart) / 100) / 10;
