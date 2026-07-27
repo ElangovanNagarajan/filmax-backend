@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { checkWatch } from './check-core.js';
-import { getWatches, getState, saveState, getControl } from './gist-store.js';
+import { getWatches, getState, saveState, getControl, saveControl } from './gist-store.js';
 import { sendAlert } from './telegram.js';
 import { shutdownBrowser } from './browser.js';
 
@@ -17,13 +17,22 @@ function mergeState(state, watchId, patch) {
   return state;
 }
 
-async function tickAll() {
-  const control = await getControl();
-  if (control.master === false) { console.log('[runner] master OFF — skipping'); return; }
+// Run a check pass. When `onlyIds` is given (a manual "check" / "check all"
+// request from the app), we check just those watches and ignore the master
+// OFF switch + enabled flag, since the user explicitly asked for it.
+async function tickAll(onlyIds = null) {
+  const manual = Array.isArray(onlyIds) && onlyIds.length && !onlyIds.includes('all');
+  const checkAll = Array.isArray(onlyIds) && onlyIds.includes('all');
+  if (!onlyIds) {
+    const control = await getControl();
+    if (control.master === false) { console.log('[runner] master OFF — skipping'); return; }
+  }
   const watches = await getWatches();
   const state = await getState();
-  const active = watches.filter((w) => w.enabled !== false);
-  if (!active.length) { console.log('[runner] no active watches'); return; }
+  let active = watches.filter((w) => w.enabled !== false);
+  if (manual) active = watches.filter((w) => onlyIds.includes(w.id));
+  else if (checkAll) active = watches; // check every watch regardless of pause
+  if (!active.length) { console.log('[runner] no watches to check'); return; }
 
   for (const watch of active) {
     // Carry forward persisted seen-set so alerts don't re-fire across runs.
@@ -45,18 +54,50 @@ async function tickAll() {
   await saveState(state);
 }
 
+// Track the last manual-check request we've already served, so we run each
+// checkNow exactly once. Compares the request timestamp written by the app.
+let lastServedCheckTs = 0;
+
+// If the app has posted a fresh checkNow request, run it immediately and clear
+// it from control.json. Returns true if a manual check ran.
+async function serveManualCheck() {
+  const control = await getControl();
+  const req = control.checkNow;
+  if (!req || !req.ts || req.ts <= lastServedCheckTs) return false;
+  lastServedCheckTs = req.ts;
+  const ids = Array.isArray(req.ids) && req.ids.length ? req.ids : ['all'];
+  console.log(`[runner] manual check requested: ${ids.join(', ')}`);
+  await tickAll(ids);
+  // Clear the request (read-modify-write so we don't clobber master).
+  const fresh = await getControl();
+  if (fresh.checkNow && fresh.checkNow.ts === req.ts) {
+    const { checkNow, ...rest } = fresh;
+    await saveControl(rest);
+  }
+  return true;
+}
+
 async function main() {
   console.log(`[runner] starting — will loop for ~${RUN_MINUTES}m, every ${INTERVAL_SEC}s`);
+  // Don't re-serve a checkNow left over from before this shift started.
+  try { lastServedCheckTs = (await getControl()).checkNow?.ts || 0; } catch { /* ignore */ }
   let pass = 0;
   while (Date.now() < DEADLINE) {
     const started = Date.now();
     pass++;
     console.log(`[runner] pass #${pass} @ ${new Date().toISOString()}`);
     await tickAll();
+    // Wait out the interval, but poll for manual-check requests every ~5s so
+    // the app's "check now" / "check all" buttons feel responsive.
     const elapsed = Date.now() - started;
-    const wait = Math.max(0, INTERVAL_SEC * 1000 - elapsed);
+    let wait = Math.max(0, INTERVAL_SEC * 1000 - elapsed);
     if (Date.now() + wait >= DEADLINE) break;
-    await new Promise((r) => setTimeout(r, wait));
+    while (wait > 0) {
+      const step = Math.min(5000, wait);
+      await new Promise((r) => setTimeout(r, step));
+      wait -= step;
+      try { await serveManualCheck(); } catch (e) { console.error('[runner] manual check error:', e.message); }
+    }
   }
   await shutdownBrowser();
   console.log('[runner] shift complete — exiting so the workflow can relaunch');

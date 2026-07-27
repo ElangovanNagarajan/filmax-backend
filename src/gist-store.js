@@ -61,6 +61,9 @@ export async function saveState(state) {
 export async function getControl() {
   return await readFile('control.json', { master: true });
 }
+export async function saveControl(control) {
+  await writeFiles({ 'control.json': control });
+}
 export function gistConfigured() {
   return Boolean(GIST_ID && TOKEN);
 }
