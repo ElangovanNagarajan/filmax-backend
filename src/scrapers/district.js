@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { normalizeLanguage, normalizeFormat, normalizeSubtitle, extractSubtitleFrom } from './show-labels.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -98,11 +99,19 @@ function extractSessions(nextData) {
       const total = s.total ?? null;
       const status = s.seatStatus || '';
       const soldOut = avail === 0 || /sold out/i.test(status);
-      const subtitle = s.subtitle || '';
-      const scrnFmt = s.scrnFmt || '';
-      const fmtParts = [];
-      if (scrnFmt) fmtParts.push(scrnFmt);
-      if (subtitle) fmtParts.push(subtitle);
+      // Language / format / subtitle are kept as three SEPARATE fields and are
+      // never concatenated here — the app composes the display line itself.
+      // district's session payload spells these a few different ways depending
+      // on the endpoint version, so check each known key.
+      const rawLang = s.lang || s.language || s.langName || s.movieLang || '';
+      const language = normalizeLanguage(rawLang);
+      // scrnFmt is like "2D", "3D", "IMAX 3D" — but sometimes arrives as
+      // "2D ENG" with the subtitle glued on. Split the format out cleanly.
+      const scrnFmt = s.scrnFmt || s.screenFormat || '';
+      const format = normalizeFormat(scrnFmt);
+      // Subtitle language, e.g. "ENG". Ignore it when it merely repeats the
+      // audio language (an English film subtitled ENG tells the user nothing).
+      const subtitle = normalizeSubtitle(s.subtitle || extractSubtitleFrom(scrnFmt), language);
       const encSessionId = s.encSessionId || `${c.entityCode}-${s.sid}-${s.mid?.toLowerCase?.() || ''}-${c.entityCode}`;
       result.push({
         sid: String(s.sid),
@@ -111,8 +120,8 @@ function extractSessions(nextData) {
         date: ist.date,
         time: ist.time,
         display: ist.display,
-        format: fmtParts.join(' '),
-        language: '',
+        format,
+        language,
         subtitle,
         avail,
         total,

@@ -41,6 +41,11 @@ async function tickAll(onlyIds = null) {
     try {
       const { patch, alert } = await checkWatch(merged);
       mergeState(state, watch.id, patch);
+      // Publish THIS watch's result immediately rather than waiting for every
+      // other watch in the pass to finish. Previously state was saved once at
+      // the end, so the Telegram alert (sent below) beat the app to the data
+      // and the home screen looked stale for the rest of the pass.
+      await saveState(state);
       if (alert) {
         const ok = await sendAlert({ movie: watch.movie, theater: watch.theaters.join(', '), url: alert.url, body: alert.body });
         console.log(`[runner] ${ok ? 'ALERT SENT' : 'alert FAILED'} "${watch.movie}" — ${alert.count} new show(s)`);

@@ -2,6 +2,7 @@ import { checkBMS } from './scrapers/bookmyshow.js';
 import { checkDistrict } from './scrapers/district.js';
 import { getEventCode, saveEventCode } from './event-codes.js';
 import { resolveBmsSeatUrl } from './scrapers/bms_seat_resolver.js';
+import { normalizeSubtitle } from './scrapers/show-labels.js';
 
 function movieSlug(movie) {
   return movie.toLowerCase().replace(/^(the|a|an)\s+/i, '').replace(/[^a-z0-9]+/g, '-');
@@ -53,6 +54,17 @@ function normalizeTime(t) {
   if (ampm === 'AM' && h === 12) h = 0;
   return `${String(h).padStart(2, '0')}:${min}`;
 }
+// Merge the three display labels field-by-field. Whichever site supplies a
+// value wins for that field only — we never pick "the longest string", which
+// used to let a combined value like "2D ENG" beat a clean "2D".
+function mergeLabels(a, b) {
+  return {
+    language: a.language || b.language || '',
+    format: a.format || b.format || '',
+    subtitle: a.subtitle || b.subtitle || '',
+  };
+}
+
 function deduplicateSessions(sessions) {
   const map = new Map();
   for (const s of sessions) {
@@ -63,17 +75,41 @@ function deduplicateSessions(sessions) {
       if (s.source === 'bms' && existing.source === 'district') {
         existing.bmsCinemaCity = s.bmsCinemaCity; existing.bmsCinemaSlug = s.bmsCinemaSlug;
         existing.bmsCinemaCode = s.bmsCinemaCode; existing.bookUrl = s.bookUrl; existing.source = 'both';
-        if ((s.format || '').length > (existing.format || '').length) existing.format = s.format;
-        if (s.language && !existing.language) existing.language = s.language;
+        Object.assign(existing, mergeLabels(existing, s));
       } else if (s.source === 'district' && existing.source === 'bms') {
         const bmsFields = { bmsCinemaCity: existing.bmsCinemaCity, bmsCinemaSlug: existing.bmsCinemaSlug, bmsCinemaCode: existing.bmsCinemaCode, bookUrl: existing.bookUrl };
-        const format = (existing.format || '').length >= (s.format || '').length ? existing.format : s.format;
-        const language = existing.language || s.language || '';
-        map.set(key, { ...s, ...bmsFields, source: 'both', sid: key, format, language });
+        map.set(key, { ...s, ...bmsFields, source: 'both', sid: key, ...mergeLabels(existing, s) });
       }
     }
   }
   return [...map.values()];
+}
+
+// A show should never render as a bare "3D" with no language. When a site omits
+// the language (district often does), borrow the one the rest of this movie's
+// shows agree on — a single film in a single city runs in one language far more
+// often than not. Same idea for a missing format.
+function fillMissingLabels(sessions) {
+  const tally = (field) => {
+    const counts = new Map();
+    for (const s of sessions) if (s[field]) counts.set(s[field], (counts.get(s[field]) || 0) + 1);
+    let best = '', bestN = 0;
+    for (const [v, n] of counts) if (n > bestN) { best = v; bestN = n; }
+    return best;
+  };
+  const commonLanguage = tally('language');
+  const commonFormat = tally('format');
+  for (const s of sessions) {
+    if (!s.language && commonLanguage) s.language = commonLanguage;
+    if (!s.format && commonFormat) s.format = commonFormat;
+    // Subtitle is deliberately NOT back-filled — a blank means "the site didn't
+    // advertise subtitles for this show", which is information in itself.
+    // Re-check it against the *final* language: one site may have reported
+    // "ENG" before we knew the film runs in English, and "English · 2D · ENG"
+    // tells the user nothing they don't already know.
+    s.subtitle = normalizeSubtitle(s.subtitle, s.language);
+  }
+  return sessions;
 }
 
 function formatAlert(movie, theater, alertable) {
@@ -97,9 +133,14 @@ export async function checkWatch(watch) {
   const runStart = Date.now();
   const args = { movie: watch.movie, city: watch.city, theaters: watch.theaters, dateFrom: watch.dateFrom || undefined, dateTo: watch.dateTo || undefined };
 
-  const results = [];
-  if (watch.sites.includes('district')) results.push({ siteName: 'district.in', res: await withRetry(() => checkDistrict(args)) });
-  if (watch.sites.includes('bms')) results.push({ siteName: 'BookMyShow', res: await withRetry(() => checkBMS(args)) });
+  // Scrape both sites CONCURRENTLY. They're independent network calls, so
+  // running them in sequence made every check take district-time + bms-time.
+  // In parallel a pass costs only the slower of the two.
+  const jobs = [];
+  if (watch.sites.includes('district')) jobs.push({ siteName: 'district.in', p: withRetry(() => checkDistrict(args)) });
+  if (watch.sites.includes('bms')) jobs.push({ siteName: 'BookMyShow', p: withRetry(() => checkBMS(args)) });
+  const settled = await Promise.all(jobs.map((j) => j.p.catch((e) => ({ reason: e.message || 'error' }))));
+  const results = jobs.map((j, i) => ({ siteName: j.siteName, res: settled[i] }));
 
   const rawSessions = [];
   const reasons = [];
@@ -110,7 +151,11 @@ export async function checkWatch(watch) {
     if (res.reason) reasons.push(friendlyReason(res.reason, siteName));
   }
 
-  const allCurrent = deduplicateSessions(rawSessions);
+  const allCurrent = fillMissingLabels(deduplicateSessions(rawSessions));
+  // NOTE: `now` is only used for alert/lastSeen bookkeeping. `lastChecked` is
+  // stamped at the very END of the pass (see below) — stamping it here would
+  // make the app say "3m ago" the instant a 3-minute check finished, because
+  // the timestamp would predate all the seat-URL resolution work that follows.
   const now = new Date().toISOString();
   const seenSet = new Set(watch.seenSids || []);
   const currentSidSet = new Set(allCurrent.map((s) => s.sid));
@@ -137,14 +182,21 @@ export async function checkWatch(watch) {
   const toResolve = allCurrent
     .filter((s) => !s.resolvedSeatUrl && !s.soldOut && s.bmsCinemaSlug && s.bmsCinemaCode)
     .slice(0, 6);
-  for (const s of toResolve) {
-    try {
-      const url = await resolveBmsSeatUrl({
-        city: s.bmsCinemaCity, slug: s.bmsCinemaSlug, cinemaCode: s.bmsCinemaCode,
-        date: s.date, time: s.time, movieHint: watch.movie,
-      });
-      if (url) s.resolvedSeatUrl = url;
-    } catch { /* leave unresolved; app falls back to cinema date page */ }
+  // Resolve in parallel (bounded to 3 at a time so we don't hammer BMS or
+  // exhaust browser contexts). Sequentially this was the single biggest cost
+  // in a pass — 6 page loads back-to-back.
+  const RESOLVE_CONCURRENCY = 3;
+  for (let i = 0; i < toResolve.length; i += RESOLVE_CONCURRENCY) {
+    const batch = toResolve.slice(i, i + RESOLVE_CONCURRENCY);
+    await Promise.all(batch.map(async (s) => {
+      try {
+        const url = await resolveBmsSeatUrl({
+          city: s.bmsCinemaCity, slug: s.bmsCinemaSlug, cinemaCode: s.bmsCinemaCode,
+          date: s.date, time: s.time, movieHint: watch.movie,
+        });
+        if (url) s.resolvedSeatUrl = url;
+      } catch { /* leave unresolved; app falls back to cinema date page */ }
+    }));
   }
 
   // Resolve/refresh the movie-page URL for the movie-name tap.
@@ -160,8 +212,12 @@ export async function checkWatch(watch) {
   }
   const moviePageUrl = resolveMoviePageUrl(watch, allCurrent, eventCode);
 
+  // Stamp lastChecked NOW — at the true end of the pass, after scraping and
+  // seat-URL resolution are done. This is the moment the data became current,
+  // so the app's "Last check: Xs ago" counts from when the check *finished*.
+  const finishedAt = new Date().toISOString();
   const checkDurationSec = Math.round((Date.now() - runStart) / 100) / 10;
-  const patch = { lastChecked: now, lastStatus: status, currentSessions: allCurrent, lastDurationSec: checkDurationSec };
+  const patch = { lastChecked: finishedAt, lastStatus: status, currentSessions: allCurrent, lastDurationSec: checkDurationSec };
   if (moviePageUrl) patch.moviePageUrl = moviePageUrl;
   if (movieUrl) patch.bmsMovieUrl = movieUrl;
   if (allCurrent.length) patch.lastSeen = now;

@@ -1,4 +1,5 @@
 import { withPage } from '../browser.js';
+import { normalizeLanguage, normalizeFormat, normalizeSubtitle } from './show-labels.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -270,15 +271,17 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
               if (!r.movieTitle.toLowerCase().includes(movieLower)) continue;
               const tier = tierFromRgb(r.rgb || [0, 0, 0]);
               const seatStatusLabel = { available: 'Available', filling: 'Filling Fast', 'almost-full': 'Almost Full', critical: 'Almost Sold Out', 'sold-out': 'Sold Out', unknown: '' }[tier];
-              const fmtParts = [];
-              if (r.language && r.language.toLowerCase() !== 'english' && r.language.toLowerCase() !== 'tamil') fmtParts.push(r.language.toUpperCase());
-              if (r.format) fmtParts.push(r.format);
-              if (r.subtitle) fmtParts.push(r.subtitle);
+              // Three independent labels — the subtitle is NOT folded into
+              // `format` any more. Doing that (while also emitting it on its
+              // own) is what made the app render "English · 2D ENG · ENG".
+              const language = normalizeLanguage(r.language);
+              const format = normalizeFormat(r.format);
+              const subtitle = normalizeSubtitle(r.subtitle, language);
               const bookUrl = `https://in.bookmyshow.com/cinemas/${cinema.city}/${cinema.slug}/buytickets/${cinema.cinemaCode}/${dateToCompact(d)}`;
               all.push({
                 sid: `bms:${cinema.cinemaCode}:${d}:${r.time}`,
                 cid: cinema.cinemaCode, theater: cinema.displayName, date: d, time: r.time,
-                display: `${d} ${r.time}`, format: fmtParts.join(' '), language: r.language || '', subtitle: r.subtitle || '',
+                display: `${d} ${r.time}`, format, language, subtitle,
                 avail: null, total: null, seatStatus: seatStatusLabel, soldOut: tier === 'sold-out', tier,
                 bookUrl, source: 'bms', bmsCinemaCity: cinema.city, bmsCinemaSlug: cinema.slug, bmsCinemaCode: cinema.cinemaCode,
               });
