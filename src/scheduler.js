@@ -14,7 +14,7 @@ function isNetworkError(reason) {
 function friendlyReason(reason, siteName) {
   if (!reason) return '';
   if (isNetworkError(reason)) return `${siteName}: network issue (will retry)`;
-  if (reason.includes('movie-not-listed')) return `${siteName}: movie not listed`;
+  if (reason.includes('movie-not-listed')) return `${siteName}: couldn't find this movie — check the spelling`;
   if (reason.includes('no-cinema-resolved')) return `${siteName}: theater not found`;
   if (reason.includes('blocked')) return `${siteName}: temporarily blocked`;
   return `${siteName}: ${reason.replace(/^error:\s*/, '').slice(0, 60)}`;

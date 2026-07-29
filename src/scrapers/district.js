@@ -22,24 +22,44 @@ function extractNextData(html) {
   }
 }
 
+// Collapse a title to just its letters and digits, so "Spider-Man: Brand New
+// Day", "Spiderman Brand New Day" and "spider man brand new day" all reduce to
+// the same key. The old matcher built a regex straight from the typed name, so
+// a missing hyphen ("Spiderman" vs the site's "spider-man") produced a NO MATCH
+// that surfaced to the user as "movie not listed" — a spelling slip masquerading
+// as an absent movie.
+function slugKey(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 async function findMovieUrl(movie, city) {
   const html = await fetchHtml('https://www.district.in/movies/');
   const slugCity = String(city || 'chennai').toLowerCase().replace(/\s+/g, '-');
-  const movieLower = movie.toLowerCase().replace(/^(the|a|an)\s+/i, '').trim();
-  const pattern = new RegExp(
-    `https://www\\.district\\.in/movies/[a-z0-9-]*${movieLower.replace(/[^a-z0-9]/g, '[a-z0-9-]*')}[a-z0-9-]*-movie-tickets-in-${slugCity}-MV\\d+`,
-    'i',
-  );
-  const match = html.match(pattern);
-  if (match) return match[0];
-  const looseRe = new RegExp(
-    `https://www\\.district\\.in/movies/[a-z0-9-]*${movieLower.replace(/[^a-z0-9]/g, '[a-z0-9-]*')}[a-z0-9-]*-movie-tickets-MV(\\d+)`,
-    'i',
-  );
-  const loose = html.match(looseRe);
-  if (loose) {
-    // Force city into slug
-    return loose[0].replace('-movie-tickets-MV', `-movie-tickets-in-${slugCity}-MV`);
+  const wantKey = slugKey(movie.replace(/^(the|a|an)\s+/i, ''));
+  if (!wantKey) return null;
+
+  // Walk every movie link on the page and compare on the letters-and-digits
+  // key. Prefer a link that already carries our city; fall back to any city
+  // (forcing our city into the slug) so a movie listed only in another city's
+  // block still resolves.
+  const linkRe = /https:\/\/www\.district\.in\/movies\/([a-z0-9-]+?)-movie-tickets(?:-in-([a-z0-9-]+))?-MV\d+/gi;
+  let cityMatch = null;
+  let looseMatch = null;
+  let m;
+  while ((m = linkRe.exec(html))) {
+    const url = m[0];
+    const key = slugKey(m[1]);
+    const urlCity = m[2] || '';
+    // Either side may be the longer string (typed "Spiderman" vs slug
+    // "spidermanbrandnewday", or vice-versa), so accept a match in both
+    // directions rather than requiring exact equality.
+    if (!(key.includes(wantKey) || wantKey.includes(key))) continue;
+    if (urlCity === slugCity) { cityMatch = url; break; }
+    if (!looseMatch) looseMatch = url;
+  }
+  if (cityMatch) return cityMatch;
+  if (looseMatch) {
+    return looseMatch.replace(/-movie-tickets(-in-[a-z0-9-]+)?-MV/, `-movie-tickets-in-${slugCity}-MV`);
   }
   return null;
 }

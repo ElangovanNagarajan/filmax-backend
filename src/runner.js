@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { checkWatch } from './check-core.js';
 import { getWatches, getState, saveState, getControl, saveControl } from './gist-store.js';
-import { sendAlert } from './telegram.js';
+import { sendAlert, sendTestMessage } from './telegram.js';
 import { shutdownBrowser } from './browser.js';
 
 // Self-looping worker for GitHub Actions.
@@ -14,7 +14,7 @@ const DEADLINE = Date.now() + RUN_MINUTES * 60 * 1000;
 // How often to refresh lastChecked when nothing has actually changed. Gist
 // writes are capped at 100/hour (see gist-store.js), and the app's own buttons
 // need room in that budget, so a no-change pass doesn't get to write every time.
-const HEARTBEAT_MIN = Number(process.env.HEARTBEAT_MIN) || 10;
+const HEARTBEAT_MIN = Number(process.env.HEARTBEAT_MIN) || 3;
 let lastHeartbeat = 0;
 
 function mergeState(state, watchId, patch) {
@@ -95,6 +95,34 @@ async function tickAll(onlyIds = null) {
 // Track the last manual-check request we've already served, so we run each
 // checkNow exactly once. Compares the request timestamp written by the app.
 let lastServedCheckTs = 0;
+// Same idea for the Settings "Telegram" test button: the app can't hold the
+// bot token (it would have to ship in the public APK), so it drops a
+// testTelegram request in control.json and the runner — which does hold the
+// token as a GitHub secret — sends the message on its behalf.
+let lastServedTestTs = 0;
+
+// If the app has posted a fresh testTelegram request, send the test message
+// and clear it. Returns true if one was served.
+async function serveTelegramTest() {
+  const control = await getControl();
+  const req = control.testTelegram;
+  if (!req || !req.ts || req.ts <= lastServedTestTs) return false;
+  lastServedTestTs = req.ts;
+  console.log('[runner] Telegram test requested');
+  try {
+    const ok = await sendTestMessage();
+    console.log(`[runner] Telegram test ${ok ? 'sent' : 'skipped (token/chat not set)'}`);
+  } catch (e) {
+    console.error('[runner] Telegram test failed:', e.message);
+  }
+  // Clear the request (read-modify-write so we don't clobber master/checkNow).
+  const fresh = await getControl();
+  if (fresh.testTelegram && fresh.testTelegram.ts === req.ts) {
+    const { testTelegram, ...rest } = fresh;
+    await saveControl(rest);
+  }
+  return true;
+}
 
 // If the app has posted a fresh checkNow request, run it immediately and clear
 // it from control.json. Returns true if a manual check ran.
@@ -117,8 +145,12 @@ async function serveManualCheck() {
 
 async function main() {
   console.log(`[runner] starting — will loop for ~${RUN_MINUTES}m, every ${INTERVAL_SEC}s`);
-  // Don't re-serve a checkNow left over from before this shift started.
-  try { lastServedCheckTs = (await getControl()).checkNow?.ts || 0; } catch { /* ignore */ }
+  // Don't re-serve a checkNow / testTelegram left over from before this shift.
+  try {
+    const c = await getControl();
+    lastServedCheckTs = c.checkNow?.ts || 0;
+    lastServedTestTs = c.testTelegram?.ts || 0;
+  } catch { /* ignore */ }
   let pass = 0;
   while (Date.now() < DEADLINE) {
     const started = Date.now();
@@ -135,6 +167,7 @@ async function main() {
       await new Promise((r) => setTimeout(r, step));
       wait -= step;
       try { await serveManualCheck(); } catch (e) { console.error('[runner] manual check error:', e.message); }
+      try { await serveTelegramTest(); } catch (e) { console.error('[runner] telegram test error:', e.message); }
     }
   }
   await shutdownBrowser();
