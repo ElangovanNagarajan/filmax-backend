@@ -37,13 +37,28 @@ async function readFile(name, fallback) {
   }
 }
 
+// Gist writes have their own hourly ceiling, separate from the 5,000/hour core
+// quota: `gist_update` allows only 100. Nothing tells you this up front — you
+// find out when a PATCH returns 403 with x-ratelimit-resource: gist_update
+// while /rate_limit still cheerfully reports ~4,950 core requests left.
+//
+// So a write that would be a no-op is not free, it's 1% of the hour's budget.
+// Skipping unchanged content is what keeps the app's own buttons working.
+let lastWritten = new Map();
+
 async function writeFiles(files) {
   if (!GIST_ID || !TOKEN) throw new Error('GIST_ID / GH_GIST_TOKEN not set');
   const payload = { files: {} };
+  let changed = false;
   for (const [name, obj] of Object.entries(files)) {
-    payload.files[name] = { content: JSON.stringify(obj, null, 2) };
+    const content = JSON.stringify(obj, null, 2);
+    if (lastWritten.get(name) === content) continue;   // identical — don't spend a write
+    payload.files[name] = { content };
+    changed = true;
   }
+  if (!changed) return;
   await axios.patch(`${API}/gists/${GIST_ID}`, payload, { headers: headers(), timeout: 20000 });
+  for (const [name, file] of Object.entries(payload.files)) lastWritten.set(name, file.content);
 }
 
 export async function getWatches() {

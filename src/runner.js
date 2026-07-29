@@ -11,10 +11,26 @@ import { shutdownBrowser } from './browser.js';
 const RUN_MINUTES = Number(process.env.RUN_MINUTES) || 330; // ~5.5h, under the 6h job cap
 const INTERVAL_SEC = Number(process.env.INTERVAL_SEC) || 60; // keep >=60s to stay a light workload
 const DEADLINE = Date.now() + RUN_MINUTES * 60 * 1000;
+// How often to refresh lastChecked when nothing has actually changed. Gist
+// writes are capped at 100/hour (see gist-store.js), and the app's own buttons
+// need room in that budget, so a no-change pass doesn't get to write every time.
+const HEARTBEAT_MIN = Number(process.env.HEARTBEAT_MIN) || 10;
+let lastHeartbeat = 0;
 
 function mergeState(state, watchId, patch) {
   state[watchId] = { ...(state[watchId] || {}), ...patch };
   return state;
+}
+
+// Did this check produce news, or just a fresh timestamp on the same answer?
+// Only news justifies an immediate write — see the gist_update budget note in
+// gist-store.js. Everything else rides along on the end-of-pass save.
+function isNews(prior, patch) {
+  if (!prior || !prior.lastChecked) return true;              // first result ever
+  if (prior.lastStatus !== patch.lastStatus) return true;     // sold out -> open, etc.
+  const before = (prior.currentSessions || []).map((s) => `${s.sid}|${s.soldOut}`).sort().join(',');
+  const after = (patch.currentSessions || []).map((s) => `${s.sid}|${s.soldOut}`).sort().join(',');
+  return before !== after;                                    // shows appeared/vanished/changed
 }
 
 // Run a check pass. When `onlyIds` is given (a manual "check" / "check all"
@@ -34,18 +50,23 @@ async function tickAll(onlyIds = null) {
   else if (checkAll) active = watches; // check every watch regardless of pause
   if (!active.length) { console.log('[runner] no watches to check'); return; }
 
+  let anyNews = false;
   for (const watch of active) {
     // Carry forward persisted seen-set so alerts don't re-fire across runs.
     const prior = state[watch.id] || {};
     const merged = { ...watch, seenSids: prior.seenSids || watch.seenSids || [] };
     try {
       const { patch, alert } = await checkWatch(merged);
+      const news = manual || checkAll || isNews(prior, patch);
       mergeState(state, watch.id, patch);
-      // Publish THIS watch's result immediately rather than waiting for every
-      // other watch in the pass to finish. Previously state was saved once at
-      // the end, so the Telegram alert (sent below) beat the app to the data
-      // and the home screen looked stale for the rest of the pass.
-      await saveState(state);
+      // Publish THIS watch's result immediately when there's actually something
+      // to see, so the app isn't left stale while the rest of the pass runs.
+      // When the answer hasn't changed, let it wait for the end-of-pass save:
+      // gist writes are capped at 100/hour, and a pass every 60s across several
+      // watches would otherwise burn the whole budget re-stating "sold out",
+      // leaving none for the app's own Check / Add buttons.
+      // A manual check always writes — the app is watching lastChecked move.
+      if (news) { await saveState(state); anyNews = true; }
       if (alert) {
         const ok = await sendAlert({ movie: watch.movie, theater: watch.theaters.join(', '), url: alert.url, body: alert.body });
         console.log(`[runner] ${ok ? 'ALERT SENT' : 'alert FAILED'} "${watch.movie}" — ${alert.count} new show(s)`);
@@ -56,7 +77,19 @@ async function tickAll(onlyIds = null) {
       console.error(`[runner] check error "${watch.movie}":`, err.message);
     }
   }
-  await saveState(state);
+
+  // Nothing newsworthy this pass, so the only difference is a fresher
+  // lastChecked. That's worth publishing — the app shows "Last check: Xs ago" —
+  // but not once a minute: 60 writes/hour out of 100 would leave too few for
+  // the app's own buttons. Heartbeat at most every HEARTBEAT_MIN minutes.
+  const now = Date.now();
+  if (anyNews || manual || checkAll) { await saveState(state); lastHeartbeat = now; }
+  else if (now - lastHeartbeat >= HEARTBEAT_MIN * 60 * 1000) {
+    await saveState(state);
+    lastHeartbeat = now;
+  } else {
+    console.log('[runner] no change — skipping write to preserve the gist write budget');
+  }
 }
 
 // Track the last manual-check request we've already served, so we run each
