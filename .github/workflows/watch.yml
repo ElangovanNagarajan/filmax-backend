@@ -15,7 +15,8 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: write   # needed to re-dispatch itself
+  actions: write    # needed to re-dispatch itself
+  contents: write   # needed for the keepalive commit below
 
 jobs:
   watch:
@@ -23,6 +24,30 @@ jobs:
     timeout-minutes: 355   # under the 6h hard cap
     steps:
       - uses: actions/checkout@v4
+
+      # Runs FIRST, before anything that can fail, so the repo stays active
+      # even on a shift that dies during setup.
+      #
+      # Why this exists: GitHub disables a workflow's `schedule:` trigger after
+      # 60 days with no repository activity. On 2026-09-27 — exactly 60 days
+      # after the last push — it switched this one off. That killed the cron
+      # safety net AND the self-relaunch (a disabled workflow refuses dispatch),
+      # so the watcher silently stopped for two weeks. An empty commit every
+      # ~45 days resets that clock. Commits made with GITHUB_TOKEN deliberately
+      # do not trigger workflow runs, so this cannot cause a dispatch loop.
+      - name: Keepalive — stop GitHub disabling the cron
+        run: |
+          AGE_DAYS=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "last commit: ${AGE_DAYS}d ago"
+          if [ "$AGE_DAYS" -lt 45 ]; then
+            echo "under the 45d threshold — nothing to do"
+            exit 0
+          fi
+          git config user.name  "filmax-keepalive"
+          git config user.email "filmax-keepalive@users.noreply.github.com"
+          git commit --allow-empty \
+            -m "keepalive: reset the 60-day inactivity clock [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"
 
       - uses: actions/setup-node@v4
         with:
@@ -48,4 +73,18 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run watch.yml --ref ${{ github.ref_name }}
+        run: |
+          # This step failing is what ended the chain in Sept 2026, so it now
+          # re-enables itself first (dispatch is refused while disabled) and
+          # retries, rather than letting one bad API call stop the watcher.
+          gh workflow enable watch.yml || true
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run watch.yml --ref "${{ github.ref_name }}"; then
+              echo "relaunched on attempt ${attempt}"
+              exit 0
+            fi
+            echo "dispatch failed (attempt ${attempt}) — retrying in 30s"
+            sleep 30
+          done
+          echo "::error::could not relaunch — falling back to the 6-hourly cron"
+          exit 1

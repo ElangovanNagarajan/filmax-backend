@@ -22,6 +22,22 @@ function mergeState(state, watchId, patch) {
   return state;
 }
 
+// `_heartbeat` is a top-level marker, not a watch id — nothing iterates
+// state.json's keys, the app only looks up state[watch.id], so it rides along
+// harmlessly. It exists because "no shows yet" and "nobody is checking any
+// more" looked identical for the two weeks the runner was off in Sept 2026.
+// Anything reading the gist can now tell the difference.
+const HEARTBEAT_KEY = '_heartbeat';
+
+function publish(state) {
+  state[HEARTBEAT_KEY] = {
+    at: new Date().toISOString(),
+    shiftEndsAt: new Date(DEADLINE).toISOString(),
+    intervalSec: INTERVAL_SEC,
+  };
+  return saveState(state);
+}
+
 // Did this check produce news, or just a fresh timestamp on the same answer?
 // Only news justifies an immediate write — see the gist_update budget note in
 // gist-store.js. Everything else rides along on the end-of-pass save.
@@ -66,7 +82,7 @@ async function tickAll(onlyIds = null) {
       // watches would otherwise burn the whole budget re-stating "sold out",
       // leaving none for the app's own Check / Add buttons.
       // A manual check always writes — the app is watching lastChecked move.
-      if (news) { await saveState(state); anyNews = true; }
+      if (news) { await publish(state); anyNews = true; }
       if (alert) {
         const ok = await sendAlert({ movie: watch.movie, theater: watch.theaters.join(', '), url: alert.url, body: alert.body });
         console.log(`[runner] ${ok ? 'ALERT SENT' : 'alert FAILED'} "${watch.movie}" — ${alert.count} new show(s)`);
@@ -83,9 +99,9 @@ async function tickAll(onlyIds = null) {
   // but not once a minute: 60 writes/hour out of 100 would leave too few for
   // the app's own buttons. Heartbeat at most every HEARTBEAT_MIN minutes.
   const now = Date.now();
-  if (anyNews || manual || checkAll) { await saveState(state); lastHeartbeat = now; }
+  if (anyNews || manual || checkAll) { await publish(state); lastHeartbeat = now; }
   else if (now - lastHeartbeat >= HEARTBEAT_MIN * 60 * 1000) {
-    await saveState(state);
+    await publish(state);
     lastHeartbeat = now;
   } else {
     console.log('[runner] no change — skipping write to preserve the gist write budget');
@@ -151,6 +167,27 @@ async function main() {
     lastServedCheckTs = c.checkNow?.ts || 0;
     lastServedTestTs = c.testTelegram?.ts || 0;
   } catch { /* ignore */ }
+
+  // Report any gap since the last shift. Shifts hand over continuously, so a
+  // gap wider than one shift plus slack means coverage was lost — and a missed
+  // booking window is the whole reason this project exists, so say so out loud
+  // instead of resuming as if nothing happened.
+  try {
+    const prev = (await getState())[HEARTBEAT_KEY];
+    if (prev?.at) {
+      const gapMin = Math.round((Date.now() - new Date(prev.at).getTime()) / 60000);
+      if (gapMin > RUN_MINUTES + 30) {
+        const since = new Date(prev.at).toISOString();
+        console.warn(`[runner] COVERAGE GAP — nothing checked for ${gapMin}m (since ${since})`);
+        await sendAlert({
+          body: `⚠️ 70 mm Filmax was not checking for ${
+            gapMin >= 120 ? `${Math.round(gapMin / 60)}h` : `${gapMin}m`
+          } (since ${since}). Watching again now — re-check anything time-sensitive.`,
+        }).catch(() => {});
+      }
+    }
+  } catch { /* a gap report is never worth failing the shift over */ }
+
   let pass = 0;
   while (Date.now() < DEADLINE) {
     const started = Date.now();
