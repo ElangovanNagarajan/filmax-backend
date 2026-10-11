@@ -1,0 +1,24 @@
+name: diag-bms
+
+# TEMPORARY. Runs the BookMyShow diagnostic in the only environment where the
+# false-negative reproduces. Separate concurrency group so it does not queue
+# behind the live watcher shift.
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --omit=dev
+      - run: npx playwright install --with-deps chromium
+      - name: Diagnose
+        env:
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
+        run: node diag-bms.mjs
