@@ -169,11 +169,18 @@ async function scrapeCinemaPage(page, cinemaInfo, date) {
     }
     return 'not-found';
   }, targetDay);
-  if (clickResult === 'grey' || clickResult === 'not-found') return [];
+  // 'grey' is BookMyShow's own way of saying "no shows on this date", so it's a
+  // real zero. 'not-found' means the date strip never rendered — that's not an
+  // answer, and returning [] for it made a broken page look like an empty one.
+  if (clickResult === 'grey') return { rows: [], outcome: 'date-greyed' };
+  if (clickResult === 'not-found') return { rows: [], outcome: 'date-not-found' };
   await page.waitForTimeout(3500);
 
+  // A styled-components hash. BookMyShow regenerates these on every frontend
+  // deploy, so zero matches means our selector has rotted (or we got a wall) —
+  // never that the cinema has no films.
   const movieCount = await page.evaluate(() => document.querySelectorAll('div[class*="sc-1412vr2-0"]').length);
-  if (movieCount === 0) return [];
+  if (movieCount === 0) return { rows: [], outcome: 'no-movie-containers' };
 
   const rows = await page.evaluate(() => {
     const KNOWN_LANGUAGES = ['english', 'hindi', 'tamil', 'telugu', 'malayalam', 'kannada', 'bengali', 'marathi', 'gujarati', 'punjabi', 'odia', 'urdu', 'japanese', 'korean', 'french', 'spanish', 'german'];
@@ -206,7 +213,28 @@ async function scrapeCinemaPage(page, cinemaInfo, date) {
     });
     return out;
   });
-  return rows;
+  return { rows, outcome: 'ok' };
+}
+
+// Which outcomes mean "we genuinely looked". Anything else is a non-answer and
+// must not be reported as zero shows.
+const BMS_ANSWERED = new Set(['ok', 'date-greyed']);
+
+// BookMyShow's title won't always match what the user typed — "Spider-Man" vs
+// "Spider Man". Compare on letters and digits only, the way the district
+// scraper already does, so a punctuation slip isn't another silent zero.
+function slugKey(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function titleMatches(siteTitle, wantKey) {
+  if (!wantKey) return false;
+  const k = slugKey(siteTitle);
+  if (!k) return false;
+  if (k.includes(wantKey)) return true;
+  // Reverse direction only for substantial titles — a stray "A" on the page
+  // would otherwise match every movie the user could possibly type.
+  return k.length >= 4 && wantKey.includes(k);
 }
 
 export async function findAndCacheEventCode(movie, city) {
@@ -262,13 +290,17 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
       }
 
       const all = [];
-      const movieLower = movie.toLowerCase();
+      const movieKey = slugKey(movie);
+      // Dates where we never got an answer. A zero-show result is only
+      // trustworthy if this stays empty.
+      const unread = [];
       for (const cinema of resolved) {
         for (const d of dates) {
           try {
-            const rows = await scrapeCinemaPage(page, cinema, d);
+            const { rows, outcome } = await scrapeCinemaPage(page, cinema, d);
+            if (!BMS_ANSWERED.has(outcome)) unread.push(`${d} ${outcome}`);
             for (const r of rows) {
-              if (!r.movieTitle.toLowerCase().includes(movieLower)) continue;
+              if (!titleMatches(r.movieTitle, movieKey)) continue;
               const tier = tierFromRgb(r.rgb || [0, 0, 0]);
               const seatStatusLabel = { available: 'Available', filling: 'Filling Fast', 'almost-full': 'Almost Full', critical: 'Almost Sold Out', 'sold-out': 'Sold Out', unknown: '' }[tier];
               // Three independent labels — the subtitle is NOT folded into
@@ -286,8 +318,21 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
                 bookUrl, source: 'bms', bmsCinemaCity: cinema.city, bmsCinemaSlug: cinema.slug, bmsCinemaCode: cinema.cinemaCode,
               });
             }
-          } catch {}
+          } catch (err) {
+            // Was `catch {}`. A swallowed navigation timeout or bot wall became
+            // an indistinguishable "no shows yet" — the silent false negative
+            // that let the Sigma 1:00 PM show vanish from the app while it was
+            // still on sale.
+            unread.push(`${d} ${(err.message || 'error').replace(/\s+/g, ' ').slice(0, 40)}`);
+          }
         }
+      }
+      // Never report an empty board we aren't sure about. check-core treats a
+      // reason as "couldn't look" and holds the previous result instead of
+      // wiping it, and the text names which path failed so the next occurrence
+      // identifies itself rather than needing another investigation.
+      if (all.length === 0 && unread.length) {
+        return { sessions: [], showDates: dates, movieUrl, reason: `could-not-read: ${unread.slice(0, 3).join('; ')}` };
       }
       return { sessions: all, allSessions: all, showDates: dates, movieUrl };
     });

@@ -1,65 +1,51 @@
-// TEMPORARY diagnostic. Answers one question: when checkBMS reports zero shows
-// with no error, did it look and find nothing, or did it fail to look?
+// TEMPORARY. Validates the BookMyShow false-negative fix on Actions, which is
+// the only environment where BMS treats us the way the watcher sees it.
 //
-// Must run on GitHub Actions — BookMyShow serves this runner's IP differently
-// from a home connection, so reproducing locally proves nothing.
-import { withPage, shutdownBrowser } from './src/browser.js';
+// Two things must hold:
+//   1. a real watch still finds its show (the fix didn't break the happy path)
+//   2. a pass that cannot read the page reports a `reason` instead of
+//      returning a confident, silent zero
 import { checkBMS } from './src/scrapers/bookmyshow.js';
+import { shutdownBrowser } from './src/browser.js';
 
-const CINEMA = { city: 'chennai', slug: 'cinepolis-bsr-mall-omr-thoraipakkam', cinemaCode: 'CBMC' };
-const DATE = '2026-10-12';
-const MOVIE = 'Sigma';
+const REAL = { movie: 'Sigma', city: 'Chennai', theaters: ['Cinepolis bsr mall'], dateFrom: '2026-10-12', dateTo: '2026-10-12' };
 
-// The selectors the scraper depends on. Both are styled-components hashes,
-// which BookMyShow regenerates on every frontend deploy — the prime suspect.
-const MOVIE_CONTAINER = 'div[class*="sc-1412vr2-0"]';
-const SHOWTIME_CHIP = 'div[class*="sc-yr56qh-0"]';
+function show(label, res) {
+  const n = (res.sessions || []).length;
+  const reason = res.reason ?? null;
+  const verdict = n > 0
+    ? 'FOUND SHOWS'
+    : (reason ? 'zero WITH a reason (honest non-answer)' : 'zero with NO reason  <-- SILENT FALSE NEGATIVE');
+  console.log(`\n[${label}] sessions=${n} reason=${JSON.stringify(reason)}`);
+  console.log(`          -> ${verdict}`);
+  if (n) console.log(`          -> ${res.sessions[0].date} ${res.sessions[0].time} ${res.sessions[0].seatStatus} @ ${res.sessions[0].theater}`);
+  return { n, reason };
+}
 
-await withPage(async (page) => {
-  const url = `https://in.bookmyshow.com/cinemas/${CINEMA.city}/${CINEMA.slug}/buytickets/${CINEMA.cinemaCode}/${DATE.replace(/-/g, '')}`;
-  console.log('GET', url);
-  const resp = await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 }).catch((e) => {
-    console.log('NAV ERROR:', e.message);
-    return null;
-  });
-  await page.waitForTimeout(4000);
+console.log('=== 1. happy path, repeated: does the real watch keep finding its show? ===');
+const runs = [];
+for (let i = 1; i <= 3; i++) {
+  runs.push(show(`real #${i}`, await checkBMS(REAL)));
+  if (i < 3) await new Promise((r) => setTimeout(r, 20000));
+}
 
-  console.log('--- page ---');
-  console.log('  http status :', resp ? resp.status() : 'n/a');
-  console.log('  final url   :', page.url());
-  console.log('  title       :', await page.title());
+console.log('\n=== 2. a date BookMyShow does not offer: must report, not claim zero ===');
+// Far enough out that the date strip cannot contain it, forcing the
+// date-not-found path that used to return a bare [].
+const far = show('far-future', await checkBMS({ ...REAL, dateFrom: '2027-06-01', dateTo: '2027-06-01' }));
 
-  const probe = await page.evaluate((sels) => {
-    const body = document.body ? document.body.innerText : '';
-    return {
-      bodyChars: body.length,
-      movieContainers: document.querySelectorAll(sels.MOVIE_CONTAINER).length,
-      showtimeChips: document.querySelectorAll(sels.SHOWTIME_CHIP).length,
-      mentionsMovie: /sigma/i.test(body),
-      // Is this a wall rather than the page we asked for?
-      looksBlocked: /access denied|are you a human|unusual traffic|captcha|forbidden|just a moment/i.test(body),
-      // Any styled-components classes at all -> the app rendered, just not
-      // under the hashes we hardcoded.
-      sampleScClasses: [...new Set([...document.querySelectorAll('div[class*="sc-"]')]
-        .flatMap((d) => [...d.classList].filter((c) => c.startsWith('sc-'))))].slice(0, 25),
-      firstLines: body.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 15),
-    };
-  }, { MOVIE_CONTAINER, SHOWTIME_CHIP });
-
-  console.log('  body chars  :', probe.bodyChars);
-  console.log('  looksBlocked:', probe.looksBlocked);
-  console.log('  mentions "sigma":', probe.mentionsMovie);
-  console.log(`  ${MOVIE_CONTAINER} matches:`, probe.movieContainers, '  <-- 0 means SELECTOR ROT');
-  console.log(`  ${SHOWTIME_CHIP} matches:`, probe.showtimeChips);
-  console.log('  sc- classes present on page:', JSON.stringify(probe.sampleScClasses));
-  console.log('  first visible lines:', JSON.stringify(probe.firstLines, null, 2));
-});
-
-console.log('\n=== what the production code returns right now ===');
-const res = await checkBMS({ movie: MOVIE, city: 'Chennai', theaters: ['Cinepolis bsr mall'], dateFrom: DATE, dateTo: DATE });
-console.log('  sessions :', (res.sessions || []).length);
-console.log('  reason   :', JSON.stringify(res.reason ?? null), '  <-- null + 0 sessions = the silent false-negative');
-console.log('  movieUrl :', res.movieUrl || '(none)');
-if (res.sessions?.length) console.log('  first    :', JSON.stringify(res.sessions[0], null, 2));
+console.log('\n=== 3. a movie that genuinely is not playing: must stay a REAL zero ===');
+// Must NOT acquire a reason, or check-core would hold a stale board forever.
+const absent = show('absent-movie', await checkBMS({ ...REAL, movie: 'Zzzqqxnotamovie' }));
 
 await shutdownBrowser();
+
+console.log('\n==================== VERDICT ====================');
+const silent = runs.filter((r) => r.n === 0 && !r.reason).length;
+console.log(`happy-path runs finding shows : ${runs.filter((r) => r.n > 0).length}/3`);
+console.log(`happy-path silent zeros       : ${silent}  (want 0)`);
+console.log(`unreadable date reported      : ${far.n === 0 && far.reason ? 'YES' : 'NO'}  (want YES)`);
+console.log(`absent movie stayed a real zero: ${absent.n === 0 && !absent.reason ? 'YES' : 'NO'}  (want YES)`);
+const pass = silent === 0 && far.n === 0 && !!far.reason && absent.n === 0 && !absent.reason;
+console.log(pass ? 'ALL CHECKS PASS' : 'CHECKS FAILED');
+process.exit(pass ? 0 : 1);
