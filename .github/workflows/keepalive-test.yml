@@ -1,0 +1,32 @@
+name: keepalive-test
+
+# TEMPORARY. Proves the keepalive push path in watch.yml actually works,
+# without waiting 45 days for it to fire for real. Byte-identical to that
+# step except the age threshold is forced to 0 so the push always runs.
+# Separate concurrency group so it doesn't queue behind the live watcher.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Keepalive — forced
+        run: |
+          AGE_DAYS=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "last commit: ${AGE_DAYS}d ago"
+          if [ "$AGE_DAYS" -lt 0 ]; then
+            echo "under the threshold — nothing to do"
+            exit 0
+          fi
+          git config user.name  "filmax-keepalive"
+          git config user.email "filmax-keepalive@users.noreply.github.com"
+          git commit --allow-empty \
+            -m "keepalive: reset the 60-day inactivity clock [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"
+          echo "PUSH OK — commit now on ${{ github.ref_name }}"
