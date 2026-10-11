@@ -18,6 +18,30 @@ function headers() {
   };
 }
 
+// Every gist read swallows its error and returns a fallback, which is right for
+// a blip but was the last silent way to die: GH_GIST_TOKEN is a fine-grained
+// PAT, so GitHub forces it to expire. On expiry the runner would start fine,
+// fail every read, see `{}` instead of state, and sit there checking nothing —
+// and the coverage-gap alert could not fire either, because spotting a gap
+// means reading the heartbeat it just failed to read. So credential and access
+// failures are recorded here and reported by the runner over Telegram, which
+// uses a different token and keeps working.
+let accessFailure = null;
+
+function noteFailure(name, err) {
+  const status = err.response?.status;
+  if (status === 401 || status === 403 || status === 404) {
+    accessFailure = { status, file: name, at: new Date().toISOString(), message: err.message };
+  }
+}
+
+// Read-and-clear, so the runner reports a given failure once rather than every pass.
+export function takeAccessFailure() {
+  const f = accessFailure;
+  accessFailure = null;
+  return f;
+}
+
 async function readFile(name, fallback) {
   if (!GIST_ID || !TOKEN) return fallback;
   try {
@@ -32,6 +56,7 @@ async function readFile(name, fallback) {
     }
     return JSON.parse(content || 'null') ?? fallback;
   } catch (err) {
+    noteFailure(name, err);
     console.error(`[gist] read ${name} failed:`, err.message);
     return fallback;
   }
@@ -57,7 +82,13 @@ async function writeFiles(files) {
     changed = true;
   }
   if (!changed) return;
-  await axios.patch(`${API}/gists/${GIST_ID}`, payload, { headers: headers(), timeout: 20000 });
+  try {
+    await axios.patch(`${API}/gists/${GIST_ID}`, payload, { headers: headers(), timeout: 20000 });
+  } catch (err) {
+    // Record, then rethrow — callers still treat a failed write as fatal.
+    noteFailure(Object.keys(payload.files).join('+'), err);
+    throw err;
+  }
   for (const [name, file] of Object.entries(payload.files)) lastWritten.set(name, file.content);
 }
 

@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { checkWatch } from './check-core.js';
-import { getWatches, getState, saveState, getControl, saveControl } from './gist-store.js';
+import { getWatches, getState, saveState, getControl, saveControl, takeAccessFailure } from './gist-store.js';
 import { sendAlert, sendTestMessage } from './telegram.js';
 import { shutdownBrowser } from './browser.js';
 
@@ -108,6 +108,28 @@ async function tickAll(onlyIds = null) {
   }
 }
 
+// Telegram the user when the gist itself rejects us — an expired or revoked
+// GH_GIST_TOKEN otherwise looks exactly like "nothing is happening". Throttled,
+// because a dead token fails on every single pass and an alert a minute would
+// be worse than silence.
+const ACCESS_ALERT_COOLDOWN_MIN = 60;
+let lastAccessAlertAt = 0;
+
+async function reportAccessFailure() {
+  const f = takeAccessFailure();
+  if (!f) return;
+  const now = Date.now();
+  if (now - lastAccessAlertAt < ACCESS_ALERT_COOLDOWN_MIN * 60 * 1000) return;
+  lastAccessAlertAt = now;
+  const what = f.status === 403
+    ? 'refused (403) — likely the gist write budget, or the token lost access'
+    : `rejected with ${f.status} — the token is probably expired or revoked`;
+  console.error(`[runner] GIST ACCESS FAILURE on ${f.file}: ${f.status}`);
+  await sendAlert({
+    body: `⚠️ 70 mm Filmax can't reach its data store: GitHub ${what}. Watches are NOT being checked. Fix: regenerate a gist-scope token and update the GH_GIST_TOKEN secret.`,
+  }).catch(() => {});
+}
+
 // Track the last manual-check request we've already served, so we run each
 // checkNow exactly once. Compares the request timestamp written by the app.
 let lastServedCheckTs = 0;
@@ -194,6 +216,7 @@ async function main() {
     pass++;
     console.log(`[runner] pass #${pass} @ ${new Date().toISOString()}`);
     await tickAll();
+    await reportAccessFailure();
     // Wait out the interval, but poll for manual-check requests every ~5s so
     // the app's "check now" / "check all" buttons feel responsive.
     const elapsed = Date.now() - started;

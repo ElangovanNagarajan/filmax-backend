@@ -25,13 +25,29 @@ function isNetworkError(reason) {
   if (!reason) return false;
   return NETWORK_ERROR_PATTERNS.some((p) => reason.toLowerCase().includes(p.toLowerCase()));
 }
-function friendlyReason(reason, siteName) {
+export function friendlyReason(reason, siteName) {
   if (!reason) return '';
   if (isNetworkError(reason)) return `${siteName}: network issue (will retry)`;
   if (reason.includes('movie-not-listed')) return `${siteName}: couldn't find this movie — check the spelling`;
   if (reason.includes('no-cinema-resolved')) return `${siteName}: theater not found`;
-  if (reason.includes('blocked')) return `${siteName}: temporarily blocked`;
+  // district.in answers 200 to a home connection and 403 to this runner using
+  // byte-identical headers, so the block is on the datacenter IP range, not on
+  // anything we send. Worth naming precisely: "temporarily blocked" invites
+  // pointless UA-tweaking for something no header can fix.
+  if (/status code 403/i.test(reason) || reason.includes('blocked')) return `${siteName}: blocks our server's IP`;
+  if (/status code 429/i.test(reason)) return `${siteName}: rate-limited (will retry)`;
   return `${siteName}: ${reason.replace(/^error:\s*/, '').slice(0, 60)}`;
+}
+
+// "We couldn't look" vs "we looked and it isn't there". Only the first is a
+// non-answer worth holding the previous board for; the second is a real result,
+// and treating it as a non-answer would leave a finished movie showing last
+// week's shows indefinitely.
+export function isNonAnswer(reason) {
+  if (!reason) return false;
+  if (reason.includes('movie-not-listed')) return false;   // looked — absent
+  if (reason.includes('no-cinema-resolved')) return false; // looked — no such theater
+  return true;                                             // 403 / 429 / 5xx / network / unexpected
 }
 async function withRetry(fn, attempts = 2) {
   let last;
@@ -144,11 +160,12 @@ export async function checkWatch(watch) {
 
   const rawSessions = [];
   const reasons = [];
+  const rawReasons = [];
   let movieUrl = '';
   for (const { siteName, res } of results) {
     if (res.movieUrl) movieUrl = res.movieUrl;
     if (res.sessions?.length) for (const s of res.sessions) rawSessions.push({ site: siteName, ...s });
-    if (res.reason) reasons.push(friendlyReason(res.reason, siteName));
+    if (res.reason) { reasons.push(friendlyReason(res.reason, siteName)); rawReasons.push(res.reason); }
   }
 
   const allCurrent = fillMissingLabels(deduplicateSessions(rawSessions));
@@ -161,11 +178,33 @@ export async function checkWatch(watch) {
   const currentSidSet = new Set(allCurrent.map((s) => s.sid));
   const newSessions = allCurrent.filter((s) => !seenSet.has(s.sid));
 
+  // A pass that found nothing AND had a site fail has proved nothing — it
+  // cannot tell "the show is gone" from "we were unable to look". Treating the
+  // two alike is what made the app read 0 shows while BookMyShow was still
+  // selling the 1:00 PM Sigma seat: one district.in 403 overwrote
+  // currentSessions with [] and buried the good result behind the error text.
+  // Hold the previous board only when EVERY site failed to look. If one site
+  // answered and said zero, that IS evidence — trusting it is what stops a
+  // finished movie from advertising last week's shows forever.
+  const allFailedToLook = rawReasons.length > 0
+    && rawReasons.length === results.length
+    && rawReasons.every(isNonAnswer);
+  const inconclusive = allCurrent.length === 0 && allFailedToLook;
+  const priorSessions = watch.currentSessions || [];
+
   let status;
-  if (allCurrent.length === 0) status = reasons.length ? reasons.join(' · ') : 'No shows yet';
-  else {
+  if (inconclusive) {
+    status = priorSessions.length
+      ? `last known: ${priorSessions.length} show${priorSessions.length === 1 ? '' : 's'} · ${reasons.join(' · ')}`
+      : reasons.join(' · ');
+  } else if (allCurrent.length === 0) {
+    status = 'No shows yet';
+  } else {
     const open = allCurrent.filter((s) => !s.soldOut).length;
     status = `${allCurrent.length} shows · ${open} available · ${allCurrent.length - open} sold out`;
+    // Shows were found, but one site still failed — say so quietly rather than
+    // hiding it, since the list may be missing that site's screenings.
+    if (reasons.length) status += ` · ${reasons.join(' · ')}`;
   }
 
   // Carry forward already-resolved seat URLs from the previous check so we
@@ -217,7 +256,17 @@ export async function checkWatch(watch) {
   // so the app's "Last check: Xs ago" counts from when the check *finished*.
   const finishedAt = new Date().toISOString();
   const checkDurationSec = Math.round((Date.now() - runStart) / 100) / 10;
-  const patch = { lastChecked: finishedAt, lastStatus: status, currentSessions: allCurrent, lastDurationSec: checkDurationSec };
+  // On a non-answer, hold the last known board rather than blanking it.
+  const patch = {
+    lastChecked: finishedAt,
+    lastStatus: status,
+    currentSessions: inconclusive ? priorSessions : allCurrent,
+    lastDurationSec: checkDurationSec,
+    // null (not undefined) so it actively clears once a check succeeds again —
+    // mergeState spreads the patch, so undefined would leave a stale warning.
+    checkFailed: reasons.length ? reasons.join(' · ') : null,
+    staleData: inconclusive && priorSessions.length > 0,
+  };
   if (moviePageUrl) patch.moviePageUrl = moviePageUrl;
   if (movieUrl) patch.bmsMovieUrl = movieUrl;
   if (allCurrent.length) patch.lastSeen = now;
