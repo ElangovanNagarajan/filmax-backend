@@ -2,6 +2,7 @@ import { withPage } from '../browser.js';
 import { normalizeLanguage, normalizeFormat, normalizeSubtitle } from './show-labels.js';
 import { theaterMatches, titleMatches, slugKey } from './match.js';
 import { readShowsFromDom, readShowsFromText } from './bms-dom.js';
+import { getEventCode, saveEventCode } from '../event-codes.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +16,9 @@ function citySlug(city) {
 function cityCode(city) {
   const map = { chennai: 'chen', coimbatore: 'coim', bengaluru: 'bang', bangalore: 'bang', mumbai: 'mumbai', delhi: 'ncr', 'delhi-ncr': 'ncr', hyderabad: 'hyd', pune: 'pune', kolkata: 'kolk' };
   return map[citySlug(city)] || null;
+}
+function movieSlug(movie) {
+  return String(movie).toLowerCase().replace(/^(the|a|an)\s+/i, '').replace(/[^a-z0-9]+/g, '-');
 }
 function dateToCompact(d) {
   return String(d || '').replace(/-/g, '');
@@ -60,31 +64,50 @@ function tierFromRgb([r, g, b]) {
   return 'unknown';
 }
 
+// Returns { eventCode, movieUrl } when found, null when BookMyShow's movie
+// list loaded and this movie isn't on it, and THROWS when the list itself
+// never loaded — an empty or walled page is "couldn't look", not "not listed",
+// and must not be allowed to clear a board of real shows.
 async function findEventCode(page, movie, city) {
   const q = movie.toLowerCase().replace(/^(the|a|an)\s+/i, '').trim();
-  await page.goto('https://in.bookmyshow.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(1500);
-  // networkidle often never settles on this page; the links are in the HTML
-  // well before that, so a timeout here is not a failure.
-  await page.goto(`https://in.bookmyshow.com/explore/movies-${citySlug(city)}?q=${encodeURIComponent(q)}`, { waitUntil: 'networkidle', timeout: 30000 }).catch(() => {});
-  await page.waitForTimeout(2500);
-  const html = await page.content();
-  // Read every movie link on the page and match its slug with the shared
-  // matcher (so "gozilla" still finds godzilla-minus-zero). An exact title
-  // wins over a longer one that contains it ("Scene" over "Crime Scene").
-  const seen = new Map();
-  for (const m of html.matchAll(/(?:\/[a-z-]+)?\/movies\/(?:[a-z-]+\/)?([a-z0-9-]+)\/(ET\d{8})/gi)) {
-    if (!seen.has(m[2])) seen.set(m[2], m[1].toLowerCase());
-  }
+  const known = getEventCode(movie, city);
+  if (known) return { eventCode: known, movieUrl: `https://in.bookmyshow.com/${citySlug(city)}/movies/${movieSlug(movie)}/${known}` };
+
   const want = slugKey(q);
-  let best = null;
-  for (const [code, slug] of seen) {
-    if (!titleMatches(slug.replace(/-/g, ' '), movie)) continue;
-    const exact = slugKey(slug) === want;
-    if (!best || (exact && !best.exact)) best = { code, slug, exact };
+  let sawAnyMovie = false;
+  // The search page first, then the plain city listing as a second opinion.
+  for (const url of [
+    `https://in.bookmyshow.com/explore/movies-${citySlug(city)}?q=${encodeURIComponent(q)}`,
+    `https://in.bookmyshow.com/explore/movies-${citySlug(city)}`,
+  ]) {
+    await page.goto('https://in.bookmyshow.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    // networkidle often never settles on this page; the links are in the HTML
+    // well before that, so a timeout here is not a failure.
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 }).catch(() => {});
+    await page.waitForFunction(() => /\/ET\d{8}/.test(document.documentElement.innerHTML), null, { timeout: 10000 }).catch(() => {});
+    const html = await page.content();
+    // Read every movie link and match its slug with the shared matcher (so
+    // "gozilla" still finds godzilla-minus-zero). An exact title wins over a
+    // longer one that contains it ("Scene" over "Crime Scene").
+    const seen = new Map();
+    for (const m of html.matchAll(/\/movies\/(?:[a-z-]+\/)?([a-z0-9-]+)\/(ET\d{8})/gi)) {
+      if (!seen.has(m[2])) seen.set(m[2], m[1].toLowerCase());
+    }
+    if (seen.size) sawAnyMovie = true;
+    let best = null;
+    for (const [code, slug] of seen) {
+      if (!titleMatches(slug.replace(/-/g, ' '), movie)) continue;
+      const exact = slugKey(slug) === want;
+      if (!best || (exact && !best.exact)) best = { code, slug, exact };
+    }
+    if (best) {
+      saveEventCode(movie, city, best.code).catch(() => {});
+      return { eventCode: best.code, movieUrl: `https://in.bookmyshow.com/${citySlug(city)}/movies/${best.slug}/${best.code}` };
+    }
   }
-  if (!best) return null;
-  return { eventCode: best.code, movieUrl: `https://in.bookmyshow.com/${citySlug(city)}/movies/${best.slug}/${best.code}` };
+  if (!sawAnyMovie) throw new Error('movie list did not load');
+  return null;
 }
 
 // Find each typed theater's BookMyShow cinema (slug + code) by reading the
@@ -248,7 +271,11 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
       let movieUrl = '';
       const unresolved = [];
       if (needEventCode.length > 0) {
-        const found = await findEventCode(page, movie, city);
+        let found;
+        try { found = await findEventCode(page, movie, city); } catch (e) {
+          if (resolved.length === 0) return { sessions: [], showDates: [], reason: `could-not-read: ${e.message}` };
+          found = null;
+        }
         if (!found && resolved.length === 0) return { sessions: [], showDates: [], reason: 'movie-not-listed' };
         if (found) {
           movieUrl = found.movieUrl;

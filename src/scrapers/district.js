@@ -74,8 +74,10 @@ async function findMovieUrl(movie, city) {
   const linkRe = /https:\/\/www\.district\.in\/movies\/([a-z0-9-]+?)-movie-tickets(?:-in-([a-z0-9-]+))?-MV\d+/gi;
   let cityMatch = null;
   let looseMatch = null;
+  let links = 0;
   let m;
   while ((m = linkRe.exec(html))) {
+    links++;
     const url = m[0];
     const urlCity = m[2] || '';
     // Shared matcher: letters-and-digits containment either way, then a
@@ -87,6 +89,9 @@ async function findMovieUrl(movie, city) {
     if (urlCity === slugCity && (exact || !cityMatch)) { cityMatch = url; if (exact) break; }
     if (!looseMatch || exact) looseMatch = url;
   }
+  // No movie links at all means the page changed or was a wall — that's
+  // "couldn't look", and must not read as "this movie isn't listed".
+  if (!links) throw new Error('movie list did not load');
   if (cityMatch) return cityMatch;
   if (looseMatch) {
     return looseMatch.replace(/-movie-tickets(-in-[a-z0-9-]+)?-MV/, `-movie-tickets-in-${slugCity}-MV`);
@@ -246,6 +251,8 @@ export async function checkDistrict({ movie, city, theaters = [], dateFrom, date
 
     return { sessions: final, allSessions: all, showDates, movieUrl };
   } catch (err) {
-    return { sessions: [], showDates: [], reason: `error: ${err.message}` };
+    // A dropped connection arrives as an AggregateError with an empty message;
+    // fall back to its code so it's recognised (and retried) as a network blip.
+    return { sessions: [], showDates: [], reason: `error: ${err.message || err.code || 'network error'}` };
   }
 }
