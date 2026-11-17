@@ -31,7 +31,9 @@ export function friendlyReason(reason, siteName) {
   if (reason.includes('movie-not-listed')) return `${siteName}: movie not listed (not open there yet, or check the spelling)`;
   if (reason.includes('no-cinema-resolved')) {
     const names = reason.split('no-cinema-resolved:')[1]?.trim();
-    return `${siteName}: theater not found${names ? ` (${names})` : ''} — try a shorter name`;
+    // BookMyShow only lists theaters screening the movie on the watched dates,
+    // so "not showing there yet" and "misspelt" look the same from here.
+    return `${siteName}: no shows at ${names || 'that theater'} on these dates yet (or check the theater name)`;
   }
   // district.in answers 200 to a home connection and 403 to this runner using
   // byte-identical headers, so the block is on the datacenter IP range, not on

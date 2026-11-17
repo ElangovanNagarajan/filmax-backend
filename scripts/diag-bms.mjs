@@ -8,6 +8,7 @@ const CASES = [
   W('Godzilla Minus Zero', ['Rohini'], '2026-11-20'),
   W('Jailer 2', ['Sathyam'], '2026-11-18'),
   W('Ramayana', ['vr mall'], '2026-11-18', '2026-11-19'),
+  W('gozila minus zero', ['rohini sliver'], '2026-11-20'),
   W('Scene', ['Cinepolis', 'Phoenix', 'Palazzo'], '2026-11-18'),
 ];
 for (const w of CASES) {

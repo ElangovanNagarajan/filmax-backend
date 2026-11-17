@@ -23,14 +23,17 @@ export function readShowsFromDom() {
     || /^(filling fast|almost full|sold out|available|non-cancellable|cancellation available|subtitles?)$/i.test(l) || /₹|rs\.?\s*\d/i.test(l);
   const timesIn = (el) => ((el.innerText || '').match(/\b\d{1,2}:\d{2}\s*[AaPp][Mm]\b/g) || []).length;
 
-  // 1. Show-time buttons: the outermost element still containing exactly one
-  //    time, starting from each leaf whose text is a time.
+  // 1. Show-time buttons: from each leaf whose text is a time, grow outward
+  //    while the parent still holds just this one time AND still begins with
+  //    it. The second condition matters for a movie with a single show: its
+  //    whole block has one time too, but begins with the title — stop there.
   const chips = new Set();
   for (const el of document.querySelectorAll('body *')) {
     if (el.children.length) continue;
     if (!TIME.test((el.textContent || '').trim())) continue;
     let chip = el;
-    while (chip.parentElement && chip.parentElement !== document.body && timesIn(chip.parentElement) === 1) chip = chip.parentElement;
+    while (chip.parentElement && chip.parentElement !== document.body
+      && timesIn(chip.parentElement) === 1 && TIME.test(firstLine(chip.parentElement))) chip = chip.parentElement;
     chips.add(chip);
   }
 
