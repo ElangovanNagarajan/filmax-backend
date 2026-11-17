@@ -293,6 +293,7 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
       // trustworthy if this stays empty.
       const unread = [];
       const degraded = [];
+      const titlesSeen = new Set();
       for (const cinema of resolved) {
         for (const d of dates) {
           try {
@@ -302,6 +303,7 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
             // for this movie but the plain-text one does, BookMyShow has
             // reshaped its page: use the text result (times are right; seat
             // colours are unknown) and flag it so the user hears about it.
+            for (const r of rows) titlesSeen.add(r.movieTitle.replace(/\s*\([^)]*\)\s*$/, ''));
             const domHits = rows.filter((r) => titleMatches(r.movieTitle, movie));
             const textHits = textRows.filter((r) => titleMatches(r.movieTitle, movie));
             const domTimes = new Set(domHits.map((r) => r.time));
@@ -343,7 +345,10 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
       }
       // Some theaters found, others not: still report it, so a typo in one of
       // three names doesn't silently shrink the watch.
-      const note = unresolved.length ? `no-cinema-resolved: ${unresolved.join(', ')}` : undefined;
+      let note = unresolved.length ? `no-cinema-resolved: ${unresolved.join(', ')}` : undefined;
+      // Pages read fine, other films are playing, ours isn't among them: name
+      // what IS playing, so a misspelt title is obvious at a glance.
+      if (!all.length && !note && titlesSeen.size) note = `movie-not-at-theater: ${[...titlesSeen].slice(0, 5).join(', ')}`;
       if (all.length === 0 && note) return { sessions: [], showDates: dates, movieUrl, reason: note };
       return { sessions: all, allSessions: all, showDates: dates, movieUrl, note, degraded: degraded.length ? degraded.join('; ') : undefined };
     });

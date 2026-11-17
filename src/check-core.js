@@ -29,6 +29,9 @@ export function friendlyReason(reason, siteName) {
   if (!reason) return '';
   if (isNetworkError(reason)) return `${siteName}: network issue (will retry)`;
   if (reason.includes('movie-not-listed')) return `${siteName}: movie not listed (not open there yet, or check the spelling)`;
+  if (reason.startsWith('movie-not-at-theater')) {
+    return `${siteName}: not playing on these dates — now showing: ${reason.split(':').slice(1).join(':').trim()}`;
+  }
   if (reason.includes('no-cinema-resolved')) {
     const names = reason.split('no-cinema-resolved:')[1]?.trim();
     // BookMyShow only lists theaters screening the movie on the watched dates,
@@ -53,6 +56,7 @@ export function isNonAnswer(reason) {
   if (!reason) return false;
   if (reason.includes('movie-not-listed')) return false;   // looked — absent
   if (reason.includes('no-cinema-resolved')) return false; // looked — no such theater
+  if (reason.startsWith('movie-not-at-theater')) return false; // looked — other films only
   return true;                                             // 403 / 429 / 5xx / network / unexpected
 }
 async function withRetry(fn, attempts = 2) {

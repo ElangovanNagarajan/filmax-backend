@@ -4,12 +4,8 @@ import { shutdownBrowser } from '../src/browser.js';
 
 const W = (movie, theaters, d1, d2 = d1) => ({ id: movie, movie, city: 'Chennai', theaters, sites: ['bms', 'district'], dateFrom: d1, dateTo: d2, seenSids: [] });
 const CASES = [
+  W('gozila minus zero', ['rohini'], '2026-11-20'),
   W('Scene', ['Rohini'], '2026-11-18'),
-  W('Godzilla Minus Zero', ['Rohini'], '2026-11-20'),
-  W('Jailer 2', ['Sathyam'], '2026-11-18'),
-  W('Ramayana', ['vr mall'], '2026-11-18', '2026-11-19'),
-  W('gozila minus zero', ['rohini sliver'], '2026-11-20'),
-  W('Scene', ['Cinepolis', 'Phoenix', 'Palazzo'], '2026-11-18'),
 ];
 for (const w of CASES) {
   const t0 = Date.now();
