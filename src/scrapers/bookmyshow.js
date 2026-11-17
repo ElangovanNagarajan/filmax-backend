@@ -1,5 +1,6 @@
 import { withPage } from '../browser.js';
 import { normalizeLanguage, normalizeFormat, normalizeSubtitle } from './show-labels.js';
+import { theaterMatches, titleMatches, slugKey } from './match.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,81 +60,82 @@ function tierFromRgb([r, g, b]) {
 }
 
 async function findEventCode(page, movie, city) {
-  const movieLower = movie.toLowerCase().replace(/^(the|a|an)\s+/i, '').trim();
+  const q = movie.toLowerCase().replace(/^(the|a|an)\s+/i, '').trim();
   await page.goto('https://in.bookmyshow.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(1500);
-  await page.goto(`https://in.bookmyshow.com/explore/movies-${citySlug(city)}?q=${encodeURIComponent(movieLower)}`, { waitUntil: 'networkidle', timeout: 30000 });
+  // networkidle often never settles on this page; the links are in the HTML
+  // well before that, so a timeout here is not a failure.
+  await page.goto(`https://in.bookmyshow.com/explore/movies-${citySlug(city)}?q=${encodeURIComponent(q)}`, { waitUntil: 'networkidle', timeout: 30000 }).catch(() => {});
   await page.waitForTimeout(2500);
   const html = await page.content();
-  const movieRe = movieLower.replace(/[^a-z0-9]/g, '[a-z0-9-]*');
-  const patterns = [
-    new RegExp(`/[a-z-]+/movies/[a-z0-9-]*${movieRe}[a-z0-9-]*/(ET\\d{8})`, 'i'),
-    new RegExp(`/movies/[a-z-]+/[a-z0-9-]*${movieRe}[a-z0-9-]*/(ET\\d{8})`, 'i'),
-    new RegExp(`/movies/[a-z0-9-]*${movieRe}[a-z0-9-]*/(ET\\d{8})`, 'i'),
-  ];
-  for (const re of patterns) {
-    const match = html.match(re);
-    if (match) return { eventCode: match[1], movieUrl: 'https://in.bookmyshow.com' + match[0].split('?')[0] };
+  // Read every movie link on the page and match its slug with the shared
+  // matcher (so "gozilla" still finds godzilla-minus-zero). An exact title
+  // wins over a longer one that contains it ("Scene" over "Crime Scene").
+  const seen = new Map();
+  for (const m of html.matchAll(/(?:\/[a-z-]+)?\/movies\/(?:[a-z-]+\/)?([a-z0-9-]+)\/(ET\d{8})/gi)) {
+    if (!seen.has(m[2])) seen.set(m[2], m[1].toLowerCase());
   }
-  return null;
+  const want = slugKey(q);
+  let best = null;
+  for (const [code, slug] of seen) {
+    if (!titleMatches(slug.replace(/-/g, ' '), movie)) continue;
+    const exact = slugKey(slug) === want;
+    if (!best || (exact && !best.exact)) best = { code, slug, exact };
+  }
+  if (!best) return null;
+  return { eventCode: best.code, movieUrl: `https://in.bookmyshow.com/${citySlug(city)}/movies/${best.slug}/${best.code}` };
 }
 
-async function resolveCinemaUrls(page, movieEventCode, city, theaters) {
+// Find each typed theater's BookMyShow cinema (slug + code) by reading the
+// cinema links on the movie's own show page. The old route —
+// /buytickets/movie-chen-<ET>-MT/<date> plus clicking a theater name — now
+// redirects to a generic /cinemas list, so every theater came back "not
+// found". Links are read straight from the page: no clicking, no guessing.
+async function resolveCinemaUrls(page, movieEventCode, city, theaters, dates) {
   const cache = await loadCache();
   const result = {};
-  const needToClick = [];
-  for (const t of theaters) {
-    const cacheKey = `${citySlug(city)}::${t.toLowerCase()}`;
-    if (cache[cacheKey]) { result[t] = cache[cacheKey]; }
-    else { needToClick.push(t); }
-  }
-  if (needToClick.length === 0) return result;
+  const pending = theaters.filter((t) => {
+    const hit = cache[`${citySlug(city)}::${t.toLowerCase()}`];
+    if (hit) result[t] = hit;
+    return !hit;
+  });
+  if (!pending.length) return result;
 
-  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  const code = cityCode(city);
-  const url = code
-    ? `https://in.bookmyshow.com/buytickets/movie-${code}-${movieEventCode}-MT/${today}`
-    : `https://in.bookmyshow.com/movies/${citySlug(city)}/buytickets/${movieEventCode}/${today}`;
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
-  await page.waitForTimeout(5000);
+  // A theater only appears on the movie page for a date it is screening, so
+  // try the watched dates first, then today. The /cinemas list (where the old
+  // URL lands) is a last resort that holds every cinema in the city.
+  const today = new Date().toISOString().slice(0, 10);
+  const pages = [...new Set([...(dates || []), today])].slice(0, 4)
+    .map((d) => `https://in.bookmyshow.com/movies/${citySlug(city)}/x/buytickets/${movieEventCode}/${dateToCompact(d)}`);
+  pages.push('https://in.bookmyshow.com/cinemas');
 
-  for (const t of needToClick) {
+  for (const url of pages) {
+    if (!pending.some((t) => !result[t])) break;
     try {
-      const tokens = t.toLowerCase().split(/\s+/).filter((w) => w && w.length > 1);
-      const matchingName = await page.evaluate((toks) => {
-        const out = [];
-        document.querySelectorAll('[class*="edljsy"]').forEach((el) => {
-          const name = (el.innerText || '').trim();
-          const lower = name.toLowerCase();
-          if (toks.every((tok) => lower.includes(tok))) out.push(name);
-        });
-        out.sort((a, b) => a.length - b.length);
-        return out[0] || null;
-      }, tokens);
-      if (!matchingName) { result[t] = null; continue; }
-
-      let cinemaUrl = '';
-      const clickOnce = async () => {
-        try { await page.locator(`text=${matchingName}`).first().click({ force: true, timeout: 5000 }); } catch {}
-        try { await page.waitForURL(/\/cinemas\//, { timeout: 12000 }); return page.url(); } catch { return ''; }
-      };
-      cinemaUrl = await clickOnce();
-      if (!cinemaUrl) {
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-        await page.waitForTimeout(3000);
-        cinemaUrl = await clickOnce();
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 }).catch(() => {});
+      await page.waitForTimeout(3000);
+      const links = await page.evaluate(() => [...document.querySelectorAll('a[href*="/cinemas/"]')]
+        .map((a) => ({ href: a.href, text: (a.innerText || '').trim().split('\n')[0] })));
+      for (const t of pending) {
+        if (result[t]) continue;
+        const candidates = [];
+        for (const l of links) {
+          const m = l.href.match(/\/cinemas\/([a-z-]+)\/([a-z0-9-]+)\/buytickets\/([A-Z0-9]+)/);
+          if (!m) continue;
+          const name = `${l.text} ${m[2].replace(/-/g, ' ')}`;
+          if (theaterMatches(name, t)) candidates.push({ city: m[1], slug: m[2], cinemaCode: m[3], displayName: l.text || t });
+        }
+        // Shortest slug = most specific match ("rohini-silver-screens-koyambedu"
+        // over some longer cinema that merely mentions the same words).
+        candidates.sort((a, b) => a.slug.length - b.slug.length);
+        if (candidates[0]) {
+          result[t] = candidates[0];
+          cache[`${citySlug(city)}::${t.toLowerCase()}`] = candidates[0];
+        }
       }
-      if (!cinemaUrl) { result[t] = null; continue; }
-      const m = cinemaUrl.match(/\/cinemas\/([a-z-]+)\/([a-z0-9-]+)\/buytickets\/([A-Z0-9]+)/);
-      if (m) {
-        const entry = { city: m[1], slug: m[2], cinemaCode: m[3], displayName: t };
-        cache[`${citySlug(city)}::${t.toLowerCase()}`] = entry;
-        result[t] = entry;
-      } else { result[t] = null; }
-      await page.goBack({ waitUntil: 'networkidle' }).catch(() => {});
-      await page.waitForTimeout(1000);
-    } catch { result[t] = null; }
+    } catch { /* try the next page */ }
   }
+  for (const t of pending) if (!result[t]) result[t] = null;
   await saveCache(cache);
   return result;
 }
@@ -220,22 +222,7 @@ async function scrapeCinemaPage(page, cinemaInfo, date) {
 // must not be reported as zero shows.
 const BMS_ANSWERED = new Set(['ok', 'date-greyed']);
 
-// BookMyShow's title won't always match what the user typed — "Spider-Man" vs
-// "Spider Man". Compare on letters and digits only, the way the district
-// scraper already does, so a punctuation slip isn't another silent zero.
-function slugKey(s) {
-  return String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function titleMatches(siteTitle, wantKey) {
-  if (!wantKey) return false;
-  const k = slugKey(siteTitle);
-  if (!k) return false;
-  if (k.includes(wantKey)) return true;
-  // Reverse direction only for substantial titles — a stray "A" on the page
-  // would otherwise match every movie the user could possibly type.
-  return k.length >= 4 && wantKey.includes(k);
-}
+// Title and theater matching live in match.js, shared with district.
 
 export async function findAndCacheEventCode(movie, city) {
   return await withPage(async (page) => {
@@ -250,35 +237,6 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
       await page.goto('https://in.bookmyshow.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(1500);
 
-      const cache = await loadCache();
-      const cityPrefix = `${citySlug(city)}::`;
-      const resolved = [];
-      const needEventCode = [];
-      for (const t of theaters) {
-        const exactKey = `${cityPrefix}${t.toLowerCase()}`;
-        if (cache[exactKey]) { resolved.push(cache[exactKey]); continue; }
-        const tokens = t.toLowerCase().split(/[\s,:]+/).filter((w) => w.length > 2);
-        let found = null;
-        for (const [k, v] of Object.entries(cache)) {
-          if (!k.startsWith(cityPrefix)) continue;
-          const searchIn = `${k} ${(v.displayName || '').toLowerCase()} ${(v.slug || '').toLowerCase()}`;
-          if (tokens.every((tok) => searchIn.includes(tok))) { found = v; break; }
-        }
-        if (found) { resolved.push(found); cache[exactKey] = found; saveCache(cache).catch(() => {}); }
-        else { needEventCode.push(t); }
-      }
-
-      let movieUrl = '';
-      if (needEventCode.length > 0) {
-        const found = await findEventCode(page, movie, city);
-        if (found) {
-          movieUrl = found.movieUrl;
-          const cinemaMap = await resolveCinemaUrls(page, found.eventCode, city, needEventCode);
-          for (const v of Object.values(cinemaMap)) if (v) resolved.push(v);
-        }
-      }
-      if (resolved.length === 0) return { sessions: [], showDates: [], reason: 'no-cinema-resolved' };
-
       const today = new Date();
       const from = dateFrom ? new Date(dateFrom) : today;
       const to = dateTo ? new Date(dateTo) : new Date(today.getTime() + 7 * 86400e3);
@@ -289,8 +247,40 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
         cursor = new Date(cursor.getTime() + 86400e3);
       }
 
+      const cache = await loadCache();
+      const cityPrefix = `${citySlug(city)}::`;
+      const resolved = [];
+      const needEventCode = [];
+      for (const t of theaters) {
+        const exactKey = `${cityPrefix}${t.toLowerCase()}`;
+        if (cache[exactKey]) { resolved.push({ ...cache[exactKey], watchTheater: t }); continue; }
+        let found = null;
+        for (const [k, v] of Object.entries(cache)) {
+          if (!k.startsWith(cityPrefix) || !v) continue;
+          const searchIn = `${k.slice(cityPrefix.length)} ${v.displayName || ''} ${(v.slug || '').replace(/-/g, ' ')}`;
+          if (theaterMatches(searchIn, t)) { found = v; break; }
+        }
+        if (found) { resolved.push({ ...found, watchTheater: t }); cache[exactKey] = found; saveCache(cache).catch(() => {}); }
+        else { needEventCode.push(t); }
+      }
+
+      let movieUrl = '';
+      const unresolved = [];
+      if (needEventCode.length > 0) {
+        const found = await findEventCode(page, movie, city);
+        if (!found && resolved.length === 0) return { sessions: [], showDates: [], reason: 'movie-not-listed' };
+        if (found) {
+          movieUrl = found.movieUrl;
+          const cinemaMap = await resolveCinemaUrls(page, found.eventCode, city, needEventCode, dates);
+          for (const [t, v] of Object.entries(cinemaMap)) {
+            if (v) resolved.push({ ...v, watchTheater: t }); else unresolved.push(t);
+          }
+        } else unresolved.push(...needEventCode);
+      }
+      if (resolved.length === 0) return { sessions: [], showDates: [], movieUrl, reason: `no-cinema-resolved: ${unresolved.join(', ')}` };
+
+
       const all = [];
-      const movieKey = slugKey(movie);
       // Dates where we never got an answer. A zero-show result is only
       // trustworthy if this stays empty.
       const unread = [];
@@ -300,7 +290,7 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
             const { rows, outcome } = await scrapeCinemaPage(page, cinema, d);
             if (!BMS_ANSWERED.has(outcome)) unread.push(`${d} ${outcome}`);
             for (const r of rows) {
-              if (!titleMatches(r.movieTitle, movieKey)) continue;
+              if (!titleMatches(r.movieTitle, movie)) continue;
               const tier = tierFromRgb(r.rgb || [0, 0, 0]);
               const seatStatusLabel = { available: 'Available', filling: 'Filling Fast', 'almost-full': 'Almost Full', critical: 'Almost Sold Out', 'sold-out': 'Sold Out', unknown: '' }[tier];
               // Three independent labels — the subtitle is NOT folded into
@@ -315,7 +305,7 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
                 cid: cinema.cinemaCode, theater: cinema.displayName, date: d, time: r.time,
                 display: `${d} ${r.time}`, format, language, subtitle,
                 avail: null, total: null, seatStatus: seatStatusLabel, soldOut: tier === 'sold-out', tier,
-                bookUrl, source: 'bms', bmsCinemaCity: cinema.city, bmsCinemaSlug: cinema.slug, bmsCinemaCode: cinema.cinemaCode,
+                bookUrl, source: 'bms', watchTheater: cinema.watchTheater, bmsCinemaCity: cinema.city, bmsCinemaSlug: cinema.slug, bmsCinemaCode: cinema.cinemaCode,
               });
             }
           } catch (err) {
@@ -334,7 +324,11 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
       if (all.length === 0 && unread.length) {
         return { sessions: [], showDates: dates, movieUrl, reason: `could-not-read: ${unread.slice(0, 3).join('; ')}` };
       }
-      return { sessions: all, allSessions: all, showDates: dates, movieUrl };
+      // Some theaters found, others not: still report it, so a typo in one of
+      // three names doesn't silently shrink the watch.
+      const note = unresolved.length ? `no-cinema-resolved: ${unresolved.join(', ')}` : undefined;
+      if (all.length === 0 && note) return { sessions: [], showDates: dates, movieUrl, reason: note };
+      return { sessions: all, allSessions: all, showDates: dates, movieUrl, note };
     });
   } catch (err) {
     return { sessions: [], showDates: [], reason: `error: ${err.message}` };

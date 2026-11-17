@@ -29,7 +29,10 @@ export function friendlyReason(reason, siteName) {
   if (!reason) return '';
   if (isNetworkError(reason)) return `${siteName}: network issue (will retry)`;
   if (reason.includes('movie-not-listed')) return `${siteName}: couldn't find this movie — check the spelling`;
-  if (reason.includes('no-cinema-resolved')) return `${siteName}: theater not found`;
+  if (reason.includes('no-cinema-resolved')) {
+    const names = reason.split('no-cinema-resolved:')[1]?.trim();
+    return `${siteName}: theater not found${names ? ` (${names})` : ''} — try a shorter name`;
+  }
   // district.in answers 200 to a home connection and 403 to this runner using
   // byte-identical headers, so the block is on the datacenter IP range, not on
   // anything we send. Worth naming precisely: "temporarily blocked" invites
@@ -81,10 +84,19 @@ function mergeLabels(a, b) {
   };
 }
 
-function deduplicateSessions(sessions) {
+// A show's identity. Date + time alone used to be the key, which merged two
+// different theaters' 7:00 PM shows into one whenever a watch listed several
+// theaters. Single-theater watches keep the old key so their seenSids (and so
+// their "already alerted" memory) carry over unchanged.
+function sessionKey(s, multiTheater) {
+  const base = `${s.date || ''}|${normalizeTime(s.time)}`;
+  return multiTheater ? `${(s.watchTheater || s.theater || '').toLowerCase()}|${base}` : base;
+}
+
+function deduplicateSessions(sessions, multiTheater) {
   const map = new Map();
   for (const s of sessions) {
-    const key = `${s.date || ''}|${normalizeTime(s.time)}`;
+    const key = sessionKey(s, multiTheater);
     const existing = map.get(key);
     if (!existing) { map.set(key, { ...s, sid: key }); }
     else {
@@ -166,9 +178,13 @@ export async function checkWatch(watch) {
     if (res.movieUrl) movieUrl = res.movieUrl;
     if (res.sessions?.length) for (const s of res.sessions) rawSessions.push({ site: siteName, ...s });
     if (res.reason) { reasons.push(friendlyReason(res.reason, siteName)); rawReasons.push(res.reason); }
+    // Shows were found but a theater wasn't — say so without counting it as a
+    // failed look.
+    else if (res.note) reasons.push(friendlyReason(res.note, siteName));
   }
 
-  const allCurrent = fillMissingLabels(deduplicateSessions(rawSessions));
+  const multiTheater = (watch.theaters || []).length > 1;
+  const allCurrent = fillMissingLabels(deduplicateSessions(rawSessions, multiTheater));
   // NOTE: `now` is only used for alert/lastSeen bookkeeping. `lastChecked` is
   // stamped at the very END of the pass (see below) — stamping it here would
   // make the app say "3m ago" the instant a 3-minute check finished, because
@@ -198,7 +214,9 @@ export async function checkWatch(watch) {
       ? `last known: ${priorSessions.length} show${priorSessions.length === 1 ? '' : 's'} · ${reasons.join(' · ')}`
       : reasons.join(' · ');
   } else if (allCurrent.length === 0) {
-    status = 'No shows yet';
+    // Keep the reasons. A bare "No shows yet" used to hide "theater not found"
+    // and "movie not listed", so a misspelt watch looked like an unopened one.
+    status = reasons.length ? `No shows yet · ${reasons.join(' · ')}` : 'No shows yet';
   } else {
     const open = allCurrent.filter((s) => !s.soldOut).length;
     status = `${allCurrent.length} shows · ${open} available · ${allCurrent.length - open} sold out`;
@@ -209,9 +227,9 @@ export async function checkWatch(watch) {
 
   // Carry forward already-resolved seat URLs from the previous check so we
   // don't re-run Playwright for shows we've already resolved.
-  const priorByStableSid = new Map((watch.currentSessions || []).map((s) => [`${s.date}|${s.time}`, s]));
+  const priorBySid = new Map((watch.currentSessions || []).map((s) => [s.sid, s]));
   for (const s of allCurrent) {
-    const prior = priorByStableSid.get(`${s.date}|${s.time}`);
+    const prior = priorBySid.get(s.sid);
     if (prior?.resolvedSeatUrl && !s.resolvedSeatUrl) s.resolvedSeatUrl = prior.resolvedSeatUrl;
   }
 

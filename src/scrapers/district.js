@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { normalizeLanguage, normalizeFormat, normalizeSubtitle, extractSubtitleFrom } from './show-labels.js';
+import { theaterMatches, titleMatches } from './match.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -48,14 +49,15 @@ async function findMovieUrl(movie, city) {
   let m;
   while ((m = linkRe.exec(html))) {
     const url = m[0];
-    const key = slugKey(m[1]);
     const urlCity = m[2] || '';
-    // Either side may be the longer string (typed "Spiderman" vs slug
-    // "spidermanbrandnewday", or vice-versa), so accept a match in both
-    // directions rather than requiring exact equality.
-    if (!(key.includes(wantKey) || wantKey.includes(key))) continue;
-    if (urlCity === slugCity) { cityMatch = url; break; }
-    if (!looseMatch) looseMatch = url;
+    // Shared matcher: letters-and-digits containment either way, then a
+    // one-typo word match ("gozilla" -> "godzilla-minus-zero").
+    if (!titleMatches(m[1].replace(/-/g, ' '), movie)) continue;
+    // An exact title beats a longer one that merely contains it, so "Scene"
+    // picks Scene over "Crime Scene".
+    const exact = slugKey(m[1]) === wantKey;
+    if (urlCity === slugCity && (exact || !cityMatch)) { cityMatch = url; if (exact) break; }
+    if (!looseMatch || exact) looseMatch = url;
   }
   if (cityMatch) return cityMatch;
   if (looseMatch) {
@@ -181,7 +183,10 @@ export async function checkDistrict({ movie, city, theaters = [], dateFrom, date
     const seen = new Set();
     let movieMid = '';
     for (const d of datesToFetch) {
-      const dateUrl = `${movieUrl}?date=${d}`;
+      // district.in picks the day from `fromdate`. It silently ignores the old
+      // `?date=` and serves today's shows instead — which the date check below
+      // then discarded, so every future date read as zero shows.
+      const dateUrl = `${movieUrl}?fromdate=${d}`;
       try {
         const dHtml = await fetchHtml(dateUrl);
         const dNext = extractNextData(dHtml);
@@ -201,8 +206,13 @@ export async function checkDistrict({ movie, city, theaters = [], dateFrom, date
       } catch {}
     }
 
+    // Tag each show with the watched theater it matched, so check-core can
+    // line it up with the same theater's BookMyShow show.
     const wanted = theaters.length
-      ? all.filter((s) => theaters.some((t) => s.theater.toLowerCase().includes(t.toLowerCase())))
+      ? all.flatMap((s) => {
+        const t = theaters.find((term) => theaterMatches(s.theater, term));
+        return t ? [{ ...s, watchTheater: t }] : [];
+      })
       : all;
     const inRange = wanted.filter((s) => {
       const d = s.requestedDate || s.date;
