@@ -38,6 +38,7 @@ export function friendlyReason(reason, siteName) {
   // anything we send. Worth naming precisely: "temporarily blocked" invites
   // pointless UA-tweaking for something no header can fix.
   if (/status code 403/i.test(reason) || reason.includes('blocked')) return `${siteName}: blocks our server's IP`;
+  if (reason.startsWith('could-not-read')) return `${siteName}: page didn't load fully (will retry)`;
   if (/status code 429/i.test(reason)) return `${siteName}: rate-limited (will retry)`;
   return `${siteName}: ${reason.replace(/^error:\s*/, '').slice(0, 60)}`;
 }
