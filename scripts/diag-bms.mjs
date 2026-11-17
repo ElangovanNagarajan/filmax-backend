@@ -18,7 +18,12 @@ for (const [movie, theater, date] of CASES) {
     const html = await page.content();
     const links = [...new Set(html.match(/\/movies\/[a-z0-9-]+\/ET\d{8}/gi) || [])];
     console.log('explore ET links:', links.length, links.filter((l) => /godzilla|scene/i.test(l)));
-    const code = (links.find((l) => l.includes(q.split(' ')[0])) || '').match(/ET\d{8}/)?.[0];
+    const eb = await page.evaluate(() => document.body.innerText);
+    console.log('explore url', page.url(), 'blocked?', /you have been blocked/i.test(eb), 'len', html.length);
+    console.log('explore body head:', eb.slice(0, 400).replace(/\n/g, ' | '));
+    console.log('explore lines w/ term:', (eb.match(new RegExp('.*' + q.split(' ')[0] + '.*', 'gi')) || []).slice(0, 8));
+    console.log('any ET in html:', [...new Set(html.match(/[a-z0-9\/-]{0,60}ET\d{8}/gi) || [])].slice(0, 8));
+    const code = (links.find((l) => l.includes(q.split(' ')[0])) || '').match(/ET\d{8}/)?.[0] || (movie === 'Scene' ? 'ET00516631' : '');
     if (!code) return;
 
     const dc = date.replace(/-/g, '');
