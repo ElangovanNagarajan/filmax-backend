@@ -28,7 +28,7 @@ function isNetworkError(reason) {
 export function friendlyReason(reason, siteName) {
   if (!reason) return '';
   if (isNetworkError(reason)) return `${siteName}: network issue (will retry)`;
-  if (reason.includes('movie-not-listed')) return `${siteName}: couldn't find this movie — check the spelling`;
+  if (reason.includes('movie-not-listed')) return `${siteName}: movie not listed (not open there yet, or check the spelling)`;
   if (reason.includes('no-cinema-resolved')) {
     const names = reason.split('no-cinema-resolved:')[1]?.trim();
     return `${siteName}: theater not found${names ? ` (${names})` : ''} — try a shorter name`;

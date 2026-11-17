@@ -140,10 +140,15 @@ async function resolveCinemaUrls(page, movieEventCode, city, theaters, dates) {
   return result;
 }
 
-async function scrapeCinemaPage(page, cinemaInfo, date) {
+async function scrapeCinemaPage(page, cinemaInfo, date, retried = false) {
   const url = `https://in.bookmyshow.com/cinemas/${cinemaInfo.city}/${cinemaInfo.slug}/buytickets/${cinemaInfo.cinemaCode}/${dateToCompact(date)}`;
   await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
-  await page.waitForTimeout(4000);
+  // The date strip renders late and unevenly: a fixed 4s pause sometimes
+  // caught the page before it existed, and that read as "date-not-found" for
+  // a date BookMyShow was selling. Wait for the strip itself (up to 15s).
+  await page.waitForFunction(() => [...document.querySelectorAll('div')].some((el) => el.children.length
+    && /^[A-Z]{3}\s+\d{1,2}\s+[A-Z]{3}$/.test((el.innerText || '').replace(/\s+/g, ' ').trim())), null, { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1500);
 
   const targetDay = parseInt(date.slice(8, 10), 10);
   // Click target date pill if not selected, verify via opacity/text color
@@ -175,7 +180,11 @@ async function scrapeCinemaPage(page, cinemaInfo, date) {
   // real zero. 'not-found' means the date strip never rendered — that's not an
   // answer, and returning [] for it made a broken page look like an empty one.
   if (clickResult === 'grey') return { rows: [], outcome: 'date-greyed' };
-  if (clickResult === 'not-found') return { rows: [], outcome: 'date-not-found' };
+  if (clickResult === 'not-found') {
+    // One fresh load before giving up — this is usually a slow render.
+    if (!retried) return scrapeCinemaPage(page, cinemaInfo, date, true);
+    return { rows: [], outcome: `date-not-found (${page.url().includes('/buytickets/') ? 'no strip' : 'redirected'})` };
+  }
   await page.waitForTimeout(3500);
 
   // A styled-components hash. BookMyShow regenerates these on every frontend
