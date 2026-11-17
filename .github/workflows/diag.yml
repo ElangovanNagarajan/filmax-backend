@@ -6,6 +6,9 @@ on:
     paths: ['scripts/diag-bms.mjs', '.github/workflows/diag.yml']
 concurrency:
   group: diag-bms
+  cancel-in-progress: true
+permissions:
+  contents: write
 jobs:
   diag:
     runs-on: ubuntu-latest
@@ -17,4 +20,11 @@ jobs:
           node-version: 22
       - run: npm install --omit=dev
       - run: npx playwright install --with-deps chromium
-      - run: node scripts/diag-bms.mjs
+      - run: node scripts/diag-bms.mjs > diag-out.txt 2>&1 || true
+      - name: Publish output to a throwaway branch
+        run: |
+          git config user.name diag; git config user.email diag@users.noreply.github.com
+          git checkout --orphan diag-out
+          git rm -rfq --cached . ; git add -f diag-out.txt
+          git commit -qm "diag output [skip ci]"
+          git push -f origin diag-out
