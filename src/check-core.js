@@ -1,4 +1,4 @@
-import { checkBMS } from './scrapers/bookmyshow.js';
+import { checkBMS, lookupBmsCinema } from './scrapers/bookmyshow.js';
 import { checkDistrict } from './scrapers/district.js';
 import { getEventCode, saveEventCode } from './event-codes.js';
 import { resolveBmsSeatUrl } from './scrapers/bms_seat_resolver.js';
@@ -25,27 +25,26 @@ function isNetworkError(reason) {
   if (!reason) return false;
   return NETWORK_ERROR_PATTERNS.some((p) => reason.toLowerCase().includes(p.toLowerCase()));
 }
+// Short and crisp — these show on a phone card. '' means "don't show".
 export function friendlyReason(reason, siteName) {
   if (!reason) return '';
-  if (isNetworkError(reason)) return `${siteName}: network issue (will retry)`;
-  if (reason.includes('movie-not-listed')) return `${siteName}: movie not listed (not open there yet, or check the spelling)`;
+  const site = { BookMyShow: 'BMS', 'district.in': 'District' }[siteName] || siteName;
+  // district.in 403s every datacenter IP (see isNonAnswer); BookMyShow is the
+  // real source from here, so the block is noise on the card.
+  if (/status code 403/i.test(reason) || reason.includes('blocked')) return '';
+  if (isNetworkError(reason)) return `${site}: offline, retrying`;
+  if (reason.includes('movie-not-listed')) return `${site}: movie not found`;
   if (reason.startsWith('movie-not-at-theater')) {
-    return `${siteName}: not playing on these dates — now showing: ${reason.split(':').slice(1).join(':').trim()}`;
+    const titles = reason.split(':').slice(1).join(':').split(',').map((t) => t.trim()).filter(Boolean).slice(0, 3);
+    return `${site}: not playing${titles.length ? ` (now: ${titles.join(', ')})` : ''}`;
   }
   if (reason.includes('no-cinema-resolved')) {
     const names = reason.split('no-cinema-resolved:')[1]?.trim();
-    // BookMyShow only lists theaters screening the movie on the watched dates,
-    // so "not showing there yet" and "misspelt" look the same from here.
-    return `${siteName}: no shows at ${names || 'that theater'} on these dates yet (or check the theater name)`;
+    return `${site}: no shows at ${names || 'theater'} yet`;
   }
-  // district.in answers 200 to a home connection and 403 to this runner using
-  // byte-identical headers, so the block is on the datacenter IP range, not on
-  // anything we send. Worth naming precisely: "temporarily blocked" invites
-  // pointless UA-tweaking for something no header can fix.
-  if (/status code 403/i.test(reason) || reason.includes('blocked')) return `${siteName}: blocks our server's IP`;
-  if (reason.startsWith('could-not-read')) return `${siteName}: page didn't load fully (will retry)`;
-  if (/status code 429/i.test(reason)) return `${siteName}: rate-limited (will retry)`;
-  return `${siteName}: ${reason.replace(/^error:\s*/, '').slice(0, 60)}`;
+  if (reason.startsWith('could-not-read')) return `${site}: didn't load, retrying`;
+  if (/status code 429/i.test(reason)) return `${site}: busy, retrying`;
+  return `${site}: error, retrying`;
 }
 
 // "We couldn't look" vs "we looked and it isn't there". Only the first is a
@@ -182,12 +181,14 @@ export async function checkWatch(watch) {
   const rawReasons = [];
   let movieUrl = '';
   for (const { siteName, res } of results) {
-    if (res.movieUrl) movieUrl = res.movieUrl;
+    // Links we hand out are BookMyShow only — a district URL would open the
+    // district app.
+    if (res.movieUrl && /bookmyshow\.com/.test(res.movieUrl)) movieUrl = res.movieUrl;
     if (res.sessions?.length) for (const s of res.sessions) rawSessions.push({ site: siteName, ...s });
-    if (res.reason) { reasons.push(friendlyReason(res.reason, siteName)); rawReasons.push(res.reason); }
+    if (res.reason) { const f = friendlyReason(res.reason, siteName); if (f) reasons.push(f); rawReasons.push(res.reason); }
     // Shows were found but a theater wasn't — say so without counting it as a
     // failed look.
-    else if (res.note) reasons.push(friendlyReason(res.note, siteName));
+    else if (res.note) { const f = friendlyReason(res.note, siteName); if (f) reasons.push(f); }
   }
 
   const multiTheater = (watch.theaters || []).length > 1;
@@ -228,7 +229,7 @@ export async function checkWatch(watch) {
   if (inconclusive) {
     status = priorSessions.length
       ? `last known: ${priorSessions.length} show${priorSessions.length === 1 ? '' : 's'} · ${reasons.join(' · ')}`
-      : reasons.join(' · ');
+      : (reasons.join(' · ') || 'Retrying…');
   } else if (allCurrent.length === 0) {
     // Keep the reasons. A bare "No shows yet" used to hide "theater not found"
     // and "movie not listed", so a misspelt watch looked like an unopened one.
@@ -239,6 +240,17 @@ export async function checkWatch(watch) {
     // Shows were found, but one site still failed — say so quietly rather than
     // hiding it, since the list may be missing that site's screenings.
     if (reasons.length) status += ` · ${reasons.join(' · ')}`;
+  }
+
+  // Every tap must open BookMyShow, never district.in. A show that only
+  // district reported (BookMyShow failed this pass, or lists it later) gets the
+  // BookMyShow cinema for the same theater; its district link is dropped.
+  for (const s of allCurrent) {
+    if (s.bmsCinemaCode) continue;
+    const c = await lookupBmsCinema(watch.city || 'chennai', s.watchTheater || s.theater).catch(() => null);
+    if (c) Object.assign(s, { bmsCinemaCity: c.city, bmsCinemaSlug: c.slug, bmsCinemaCode: c.cinemaCode,
+      bookUrl: `https://in.bookmyshow.com/cinemas/${c.city}/${c.slug}/buytickets/${c.cinemaCode}/${String(s.date).replace(/-/g, '')}` });
+    else s.bookUrl = '';
   }
 
   // Carry forward already-resolved seat URLs from the previous check so we
@@ -312,7 +324,7 @@ export async function checkWatch(watch) {
     if (alertable.length) {
       patch.notifiedAt = now;
       const theater = watch.theaters.join(', ');
-      alert = { body: formatAlert(watch.movie, theater, alertable), url: movieUrl || 'https://in.bookmyshow.com/', count: alertable.length };
+      alert = { body: formatAlert(watch.movie, theater, alertable), url: alertable.find((x) => x.resolvedSeatUrl)?.resolvedSeatUrl || moviePageUrl || movieUrl || 'https://in.bookmyshow.com/', count: alertable.length };
     }
   }
   if (allCurrent.length) patch.seenSids = (patch.seenSids || watch.seenSids || []).filter((sid) => currentSidSet.has(sid));

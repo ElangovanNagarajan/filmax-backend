@@ -1,7 +1,7 @@
 import { withPage } from '../browser.js';
 import { normalizeLanguage, normalizeFormat, normalizeSubtitle } from './show-labels.js';
 import { theaterMatches, titleMatches, slugKey } from './match.js';
-import { readShowsFromDom, readShowsFromText } from './bms-dom.js';
+import { readShowsFromDom, readShowsFromText, readShowsFromState } from './bms-dom.js';
 import { getEventCode, saveEventCode } from '../event-codes.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -216,10 +216,14 @@ async function scrapeCinemaPage(page, cinemaInfo, date, retried = false) {
   await page.waitForFunction(() => /\b\d{1,2}:\d{2}\s*[AaPp][Mm]\b/.test(document.body.innerText || ''), null, { timeout: 10000 }).catch(() => {});
   const rows = await page.evaluate(readShowsFromDom);
   const textRows = await page.evaluate(readShowsFromText);
+  // BookMyShow's own data, limited to this date (the embedded state can lag a
+  // client-side date switch, so trust its timestamps, not the page).
+  const stateRows = (await page.evaluate(readShowsFromState).catch(() => []))
+    .filter((r) => r.showDateTime.slice(0, 8) === dateToCompact(date));
   // An open (non-grey) date with no show times at all means the page didn't
   // render — never that the cinema is empty.
-  if (!rows.length && !textRows.length) return { rows: [], textRows: [], outcome: 'no-show-times' };
-  return { rows, textRows, outcome: 'ok' };
+  if (!rows.length && !textRows.length && !stateRows.length) return { rows: [], textRows: [], stateRows: [], outcome: 'no-show-times' };
+  return { rows, textRows, stateRows, outcome: 'ok' };
 }
 
 // Which outcomes mean "we genuinely looked". Anything else is a non-answer and
@@ -227,6 +231,21 @@ async function scrapeCinemaPage(page, cinemaInfo, date, retried = false) {
 const BMS_ANSWERED = new Set(['ok', 'date-greyed']);
 
 // Title and theater matching live in match.js, shared with district.
+
+// The BookMyShow cinema for a typed theater name, from what's already been
+// resolved (no network). Lets a show that only district.in reported still
+// open in BookMyShow, at the right theater.
+export async function lookupBmsCinema(city, theater) {
+  const cache = await loadCache();
+  const prefix = `${citySlug(city)}::`;
+  const exact = cache[`${prefix}${String(theater).toLowerCase()}`];
+  if (exact) return exact;
+  for (const [k, v] of Object.entries(cache)) {
+    if (!k.startsWith(prefix) || !v) continue;
+    if (theaterMatches(`${k.slice(prefix.length)} ${v.displayName || ''} ${(v.slug || '').replace(/-/g, ' ')}`, theater)) return v;
+  }
+  return null;
+}
 
 export async function findAndCacheEventCode(movie, city) {
   return await withPage(async (page) => {
@@ -297,20 +316,38 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
       for (const cinema of resolved) {
         for (const d of dates) {
           try {
-            const { rows, textRows = [], outcome } = await scrapeCinemaPage(page, cinema, d);
+            const { rows, textRows = [], stateRows = [], outcome } = await scrapeCinemaPage(page, cinema, d);
             if (!BMS_ANSWERED.has(outcome)) unread.push(`${d} ${outcome}`);
             // Cross-check the two readers. If the structural one finds nothing
             // for this movie but the plain-text one does, BookMyShow has
             // reshaped its page: use the text result (times are right; seat
             // colours are unknown) and flag it so the user hears about it.
             for (const r of rows) titlesSeen.add(r.movieTitle.replace(/\s*\([^)]*\)\s*$/, ''));
+            const normT = (t) => String(t || '').replace(/\s+/g, ' ').trim().toUpperCase();
             const domHits = rows.filter((r) => titleMatches(r.movieTitle, movie));
             const textHits = textRows.filter((r) => titleMatches(r.movieTitle, movie));
-            const domTimes = new Set(domHits.map((r) => r.time));
-            const missed = textHits.filter((r) => !domTimes.has(r.time));
-            if (missed.length) degraded.push(`${d}: ${missed.length} show(s) only the text reader saw`);
-            for (const r of [...domHits, ...missed]) {
-              const tier = tierFromRgb(r.rgb || [0, 0, 0]);
+            const stateHits = stateRows.filter((r) => titleMatches(r.movieTitle, movie) || titleMatches(r.eventName, movie));
+            for (const r of stateRows) titlesSeen.add(r.movieTitle);
+            // Source of truth, best first: BookMyShow's own data (has the
+            // SessionId => exact seat link), then the on-screen reader (has
+            // seat colours), then the plain-text reader. Any show a later
+            // reader sees that an earlier one missed is still kept.
+            const domByTime = new Map(domHits.map((r) => [normT(r.time), r]));
+            const merged = stateHits.map((r) => ({ ...domByTime.get(normT(r.time)), ...r, rgb: domByTime.get(normT(r.time))?.rgb }));
+            const have = new Set(merged.map((r) => normT(r.time)));
+            for (const r of [...domHits, ...textHits]) {
+              if (have.has(normT(r.time))) continue;
+              have.add(normT(r.time));
+              merged.push(r);
+            }
+            const fromScreenOnly = merged.filter((r) => !r.sessionId).length;
+            if (stateHits.length && fromScreenOnly) degraded.push(`${d}: ${fromScreenOnly} show(s) missing from BookMyShow's data`);
+            else if (!stateHits.length && merged.length) degraded.push(`${d}: BookMyShow's data not found — seat links fall back to clicking`);
+            for (const r of merged) {
+              // Seat colour from the screen when we have it; otherwise
+              // BookMyShow's AvailStatus (0 = sold out, low = filling).
+              let tier = tierFromRgb(r.rgb || [0, 0, 0]);
+              if (tier === 'unknown' && r.availStatus) tier = { 0: 'sold-out', 1: 'critical', 2: 'filling' }[r.availStatus] || 'available';
               const seatStatusLabel = { available: 'Available', filling: 'Filling Fast', 'almost-full': 'Almost Full', critical: 'Almost Sold Out', 'sold-out': 'Sold Out', unknown: '' }[tier];
               // Three independent labels — the subtitle is NOT folded into
               // `format` any more. Doing that (while also emitting it on its
@@ -319,12 +356,15 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
               const format = normalizeFormat(r.format);
               const subtitle = normalizeSubtitle(r.subtitle, language);
               const bookUrl = `https://in.bookmyshow.com/cinemas/${cinema.city}/${cinema.slug}/buytickets/${cinema.cinemaCode}/${dateToCompact(d)}`;
+              const resolvedSeatUrl = r.sessionId && r.eventCode
+                ? `https://in.bookmyshow.com/movies/${cinema.city}/seat-layout/${r.eventCode}/${cinema.cinemaCode}/${r.sessionId}/${dateToCompact(d)}`
+                : undefined;
               all.push({
                 sid: `bms:${cinema.cinemaCode}:${d}:${r.time}`,
                 cid: cinema.cinemaCode, theater: cinema.displayName, movieTitle: r.movieTitle, date: d, time: r.time,
                 display: `${d} ${r.time}`, format, language, subtitle,
                 avail: null, total: null, seatStatus: seatStatusLabel, soldOut: tier === 'sold-out', tier,
-                bookUrl, source: 'bms', watchTheater: cinema.watchTheater, bmsCinemaCity: cinema.city, bmsCinemaSlug: cinema.slug, bmsCinemaCode: cinema.cinemaCode,
+                bookUrl, resolvedSeatUrl, source: 'bms', watchTheater: cinema.watchTheater, bmsCinemaCity: cinema.city, bmsCinemaSlug: cinema.slug, bmsCinemaCode: cinema.cinemaCode,
               });
             }
           } catch (err) {

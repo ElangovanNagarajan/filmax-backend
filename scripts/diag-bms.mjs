@@ -1,24 +1,23 @@
-// TEMPORARY: map the embedded BMS show data (SessionId etc.).
-import { withPage, shutdownBrowser } from '../src/browser.js';
-const URL = 'https://in.bookmyshow.com/cinemas/chennai/rohini-silver-screens-koyambedu/buytickets/RSSC/20261120';
-await withPage(async (page) => {
-  await page.goto('https://in.bookmyshow.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(1500);
-  await page.goto(URL, { waitUntil: 'networkidle', timeout: 45000 }).catch(() => {});
-  await page.waitForTimeout(3000);
-  const html = await page.content();
-  const i = html.indexOf('"SessionId"');
-  // Which <script> holds it, and how does it start?
-  const sStart = html.lastIndexOf('<script', i);
-  console.log('script tag:', html.slice(sStart, sStart + 300));
-  console.log('context before first SessionId:', html.slice(i - 2500, i + 200));
-  const res = await page.evaluate(() => {
-    const out = {};
-    for (const k of Object.keys(window)) {
-      try { const v = window[k]; if (v && typeof v === 'object' && JSON.stringify(v).includes('"SessionId"')) out[k] = JSON.stringify(v).length; } catch {}
-    }
-    return out;
-  });
-  console.log('window globals holding SessionId:', res);
-});
+// TEMPORARY: verify exact seat links for every show + short statuses.
+import { checkWatch } from '../src/check-core.js';
+import { shutdownBrowser } from '../src/browser.js';
+const W = (movie, theaters, d1, d2 = d1) => ({ id: movie, movie, city: 'Chennai', theaters, sites: ['bms', 'district'], dateFrom: d1, dateTo: d2, seenSids: [] });
+for (const w of [
+  W('Scene', ['Rohini'], '2026-11-19'),
+  W('Godzilla Minus Zero', ['Rohini'], '2026-11-20'),
+  W('Scene', ['Cinepolis', 'Phoenix', 'Palazzo'], '2026-11-19'),
+  W('Nonexistent Film Qq', ['Rohini'], '2026-11-19'),
+  W('Scene', ['Kasi Talkies'], '2026-11-19'),
+]) {
+  const t0 = Date.now();
+  const { patch, siteHealth } = await checkWatch(w);
+  const ss = patch.currentSessions;
+  console.log(`\n== ${w.movie} @ ${w.theaters.join(', ')} ${w.dateFrom} (${Math.round((Date.now() - t0) / 1000)}s)`);
+  console.log('status:', patch.lastStatus, '| card warning:', patch.checkFailed);
+  console.log('health:', JSON.stringify(siteHealth));
+  console.log('exact seat links:', ss.filter((s) => /seat-layout/.test(s.resolvedSeatUrl || '')).length, '/', ss.length,
+    '| non-BMS links:', ss.filter((s) => [s.resolvedSeatUrl, s.bookUrl].some((u) => u && !/bookmyshow/.test(u))).length,
+    '| no BMS target:', ss.filter((s) => !s.resolvedSeatUrl && !s.bmsCinemaCode).length);
+  console.log('sample:', ss.slice(0, 3).map((s) => `${s.watchTheater} ${s.time} ${s.tier} ${s.resolvedSeatUrl || s.bookUrl}`));
+}
 await shutdownBrowser();

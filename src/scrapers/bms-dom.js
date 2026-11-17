@@ -81,3 +81,42 @@ export function readShowsFromText() {
   }
   return out;
 }
+
+// BookMyShow's own data for the page, embedded as window.__INITIAL_STATE__.
+// Every show carries its SessionId, which is all the seat-layout URL needs —
+// so every show gets an exact seat link with no clicking. Found by shape (an
+// object with a ShowTimes[] of SessionIds), not by path, so a reshuffle of
+// the state tree doesn't break it. Returns [] if the state isn't there; the
+// on-screen readers above are the fallback.
+export function readShowsFromState() {
+  const root = window.__INITIAL_STATE__;
+  if (!root || typeof root !== 'object') return [];
+  const out = [];
+  const seen = new Set();
+  const walk = (o, parentTitle, depth) => {
+    if (!o || typeof o !== 'object' || depth > 30 || seen.has(o)) return;
+    seen.add(o);
+    if (Array.isArray(o)) { for (const v of o) walk(v, parentTitle, depth + 1); return; }
+    const title = o.EventTitle || parentTitle;
+    if (Array.isArray(o.ShowTimes) && o.ShowTimes.some((t) => t && t.SessionId)) {
+      for (const t of o.ShowTimes) {
+        if (!t || !t.SessionId || !t.ShowTime) continue;
+        out.push({
+          movieTitle: o.EventTitle || title || o.EventName || '',
+          eventName: o.EventName || '',
+          eventCode: o.EventCode || '',
+          language: o.EventLanguage || (String(o.EventName || '').split(' - ')[1] || ''),
+          format: o.EventDimension || '',
+          time: t.ShowTime,
+          showDateTime: String(t.ShowDateTime || ''),
+          sessionId: String(t.SessionId),
+          availStatus: String(t.AvailStatus ?? ''),
+        });
+      }
+      return;
+    }
+    for (const v of Object.values(o)) walk(v, title, depth + 1);
+  };
+  walk(root, '', 0);
+  return out;
+}
