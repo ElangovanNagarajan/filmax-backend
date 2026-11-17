@@ -35,14 +35,26 @@ export async function resolveBmsSeatUrl({ city, slug, cinemaCode, date, time, mo
     }, targetDay);
     await page.waitForTimeout(2000);
 
+    // Find the button by what it says — its time, under the right title —
+    // not by class names, which BookMyShow regenerates on deploys.
+    await page.waitForFunction(() => /\b\d{1,2}:\d{2}\s*[AaPp][Mm]\b/.test(document.body.innerText || ''), null, { timeout: 10000 }).catch(() => {});
     const result = await page.evaluate(({ time, movieHint }) => {
-      for (const c of document.querySelectorAll('div[class*="sc-1412vr2-0"]')) {
-        const title = (c.innerText || '').split('\n')[0];
-        if (movieHint && !title.toLowerCase().includes(movieHint.toLowerCase())) continue;
-        for (const chip of c.querySelectorAll('div[class*="sc-yr56qh-0"]')) {
-          const t = (chip.innerText || '').split('\n')[0].trim();
-          if (t.trim() === time.trim()) { chip.click(); return 'clicked'; }
+      const key = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const want = key(movieHint);
+      const norm = (t) => t.replace(/\s+/g, ' ').trim().toUpperCase();
+      const TIME = /^\d{1,2}:\d{2}\s*[AaPp][Mm]$/;
+      for (const el of document.querySelectorAll('body *')) {
+        if (el.children.length || norm(el.textContent || '') !== norm(time)) continue;
+        // Walk up to the first ancestor whose first line is a title, not a time.
+        let block = el.parentElement;
+        for (let up = 0; block && up < 12; up++, block = block.parentElement) {
+          const fl = ((block.innerText || '').split('\n').map((l) => l.trim()).find(Boolean) || '');
+          if (fl && !TIME.test(fl) && fl.length > 3 && !/^[A-Z]{2,4}$/.test(fl)) break;
         }
+        const title = ((block?.innerText || '').split('\n').map((l) => l.trim()).find(Boolean) || '');
+        if (want && !key(title).includes(want) && !want.includes(key(title))) continue;
+        el.click();
+        return 'clicked';
       }
       return 'not-found';
     }, { time, movieHint: movieHint || '' });

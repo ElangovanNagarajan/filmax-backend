@@ -1,6 +1,7 @@
 import { withPage } from '../browser.js';
 import { normalizeLanguage, normalizeFormat, normalizeSubtitle } from './show-labels.js';
 import { theaterMatches, titleMatches, slugKey } from './match.js';
+import { readShowsFromDom, readShowsFromText } from './bms-dom.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -187,44 +188,15 @@ async function scrapeCinemaPage(page, cinemaInfo, date, retried = false) {
   }
   await page.waitForTimeout(3500);
 
-  // A styled-components hash. BookMyShow regenerates these on every frontend
-  // deploy, so zero matches means our selector has rotted (or we got a wall) —
-  // never that the cinema has no films.
-  const movieCount = await page.evaluate(() => document.querySelectorAll('div[class*="sc-1412vr2-0"]').length);
-  if (movieCount === 0) return { rows: [], outcome: 'no-movie-containers' };
-
-  const rows = await page.evaluate(() => {
-    const KNOWN_LANGUAGES = ['english', 'hindi', 'tamil', 'telugu', 'malayalam', 'kannada', 'bengali', 'marathi', 'gujarati', 'punjabi', 'odia', 'urdu', 'japanese', 'korean', 'french', 'spanish', 'german'];
-    const out = [];
-    document.querySelectorAll('div[class*="sc-1412vr2-0"]').forEach((c) => {
-      const text = (c.innerText || '').trim();
-      if (!text) return;
-      const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-      const title = lines[0];
-      if (!title || title.length < 2 || title.length > 100) return;
-      let language = '', format = '';
-      for (let i = 1; i < Math.min(lines.length, 5); i++) {
-        const l = lines[i];
-        if (KNOWN_LANGUAGES.includes(l.toLowerCase())) { language = l; continue; }
-        const fmtMatch = l.match(/^,?\s*(2D|3D|IMAX\s*2D|IMAX\s*3D|4DX|ICE|SCREEN\s*X|MX4D)/i);
-        if (fmtMatch) { format = fmtMatch[1].toUpperCase(); continue; }
-        if (/^\d{1,2}:\d{2}\s*[AaPp][Mm]$/.test(l)) break;
-      }
-      c.querySelectorAll('div[class*="sc-yr56qh-0"]').forEach((chip) => {
-        const chipLines = (chip.innerText || '').split('\n').map((l) => l.trim()).filter(Boolean);
-        const t = chipLines[0];
-        if (!/^\d{1,2}:\d{2}\s*[AaPp][Mm]$/.test(t)) return;
-        const subtitle = chipLines.find((l, i) => i > 0 && /^[A-Z]{2,4}$/.test(l)) || '';
-        const style = window.getComputedStyle(chip);
-        const m = (style.color || '').match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
-        let r = 0, g = 0, b = 0;
-        if (m) { r = +m[1]; g = +m[2]; b = +m[3]; }
-        out.push({ movieTitle: title, time: t, rgb: [r, g, b], language, format, subtitle });
-      });
-    });
-    return out;
-  });
-  return { rows, outcome: 'ok' };
+  // Read the shows by what's visible, not by class names (see bms-dom.js).
+  // Show times render a beat after the date click; wait for the first one.
+  await page.waitForFunction(() => /\b\d{1,2}:\d{2}\s*[AaPp][Mm]\b/.test(document.body.innerText || ''), null, { timeout: 10000 }).catch(() => {});
+  const rows = await page.evaluate(readShowsFromDom);
+  const textRows = await page.evaluate(readShowsFromText);
+  // An open (non-grey) date with no show times at all means the page didn't
+  // render — never that the cinema is empty.
+  if (!rows.length && !textRows.length) return { rows: [], textRows: [], outcome: 'no-show-times' };
+  return { rows, textRows, outcome: 'ok' };
 }
 
 // Which outcomes mean "we genuinely looked". Anything else is a non-answer and
@@ -293,13 +265,22 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
       // Dates where we never got an answer. A zero-show result is only
       // trustworthy if this stays empty.
       const unread = [];
+      const degraded = [];
       for (const cinema of resolved) {
         for (const d of dates) {
           try {
-            const { rows, outcome } = await scrapeCinemaPage(page, cinema, d);
+            const { rows, textRows = [], outcome } = await scrapeCinemaPage(page, cinema, d);
             if (!BMS_ANSWERED.has(outcome)) unread.push(`${d} ${outcome}`);
-            for (const r of rows) {
-              if (!titleMatches(r.movieTitle, movie)) continue;
+            // Cross-check the two readers. If the structural one finds nothing
+            // for this movie but the plain-text one does, BookMyShow has
+            // reshaped its page: use the text result (times are right; seat
+            // colours are unknown) and flag it so the user hears about it.
+            const domHits = rows.filter((r) => titleMatches(r.movieTitle, movie));
+            const textHits = textRows.filter((r) => titleMatches(r.movieTitle, movie));
+            const domTimes = new Set(domHits.map((r) => r.time));
+            const missed = textHits.filter((r) => !domTimes.has(r.time));
+            if (missed.length) degraded.push(`${d}: ${missed.length} show(s) only the text reader saw`);
+            for (const r of [...domHits, ...missed]) {
               const tier = tierFromRgb(r.rgb || [0, 0, 0]);
               const seatStatusLabel = { available: 'Available', filling: 'Filling Fast', 'almost-full': 'Almost Full', critical: 'Almost Sold Out', 'sold-out': 'Sold Out', unknown: '' }[tier];
               // Three independent labels — the subtitle is NOT folded into
@@ -311,7 +292,7 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
               const bookUrl = `https://in.bookmyshow.com/cinemas/${cinema.city}/${cinema.slug}/buytickets/${cinema.cinemaCode}/${dateToCompact(d)}`;
               all.push({
                 sid: `bms:${cinema.cinemaCode}:${d}:${r.time}`,
-                cid: cinema.cinemaCode, theater: cinema.displayName, date: d, time: r.time,
+                cid: cinema.cinemaCode, theater: cinema.displayName, movieTitle: r.movieTitle, date: d, time: r.time,
                 display: `${d} ${r.time}`, format, language, subtitle,
                 avail: null, total: null, seatStatus: seatStatusLabel, soldOut: tier === 'sold-out', tier,
                 bookUrl, source: 'bms', watchTheater: cinema.watchTheater, bmsCinemaCity: cinema.city, bmsCinemaSlug: cinema.slug, bmsCinemaCode: cinema.cinemaCode,
@@ -337,7 +318,7 @@ export async function checkBMS({ movie, city, theaters = [], dateFrom, dateTo })
       // three names doesn't silently shrink the watch.
       const note = unresolved.length ? `no-cinema-resolved: ${unresolved.join(', ')}` : undefined;
       if (all.length === 0 && note) return { sessions: [], showDates: dates, movieUrl, reason: note };
-      return { sessions: all, allSessions: all, showDates: dates, movieUrl, note };
+      return { sessions: all, allSessions: all, showDates: dates, movieUrl, note, degraded: degraded.length ? degraded.join('; ') : undefined };
     });
   } catch (err) {
     return { sessions: [], showDates: [], reason: `error: ${err.message}` };

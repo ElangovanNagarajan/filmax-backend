@@ -14,13 +14,41 @@ async function fetchHtml(url) {
 }
 
 function extractNextData(html) {
+  // Next.js has shipped this blob as __NEXT_DATA__ for years, but don't bet the
+  // app on one id: fall back to any inline JSON script that holds show times.
+  const blobs = [];
   const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[1]);
-  } catch {
-    return null;
+  if (m) blobs.push(m[1]);
+  for (const b of html.matchAll(/<script[^>]*type="application\/(?:ld\+)?json"[^>]*>([\s\S]*?)<\/script>/g)) {
+    if (/showTime/.test(b[1])) blobs.push(b[1]);
   }
+  for (const b of blobs) {
+    try { return JSON.parse(b); } catch { /* next */ }
+  }
+  return null;
+}
+
+// Locate the per-cinema session lists by SHAPE, not by path. Any object with a
+// `sessions` array whose entries carry a `showTime` is a cinema, wherever
+// district moves it. The known path is tried first only because it's cheap.
+function findCinemaLists(root) {
+  const known = root?.props?.pageProps?.initialState?.movies?.movieSessions;
+  const knownObj = known && known[Object.keys(known)[0]];
+  if (knownObj?.arrangedSessions?.length) return { cinemas: knownObj.arrangedSessions, showDates: knownObj?.meta?.showDates || [] };
+
+  const cinemas = [];
+  let showDates = [];
+  const seen = new Set();
+  const walk = (o, depth) => {
+    if (!o || typeof o !== 'object' || depth > 25 || seen.has(o)) return;
+    seen.add(o);
+    if (Array.isArray(o)) { for (const v of o) walk(v, depth + 1); return; }
+    if (Array.isArray(o.showDates) && !showDates.length) showDates = o.showDates;
+    if (Array.isArray(o.sessions) && o.sessions.some((x) => x && typeof x.showTime === 'string')) { cinemas.push(o); return; }
+    for (const v of Object.values(o)) walk(v, depth + 1);
+  };
+  walk(root, 0);
+  return { cinemas, showDates };
 }
 
 // Collapse a title to just its letters and digits, so "Spider-Man: Brand New
@@ -103,17 +131,11 @@ function tierFromAvail(avail, total, status) {
 }
 
 function extractSessions(nextData) {
-  const ms = nextData?.props?.pageProps?.initialState?.movies?.movieSessions;
-  if (!ms) return { sessions: [], showDates: [], movieMid: '' };
-  const firstKey = Object.keys(ms)[0];
-  if (!firstKey) return { sessions: [], showDates: [], movieMid: '' };
-  const obj = ms[firstKey];
-  const cinemas = obj.arrangedSessions || [];
-  const showDates = obj?.meta?.showDates || [];
+  const { cinemas, showDates } = findCinemaLists(nextData);
   let movieMid = '';
   const result = [];
   for (const c of cinemas) {
-    const theater = c.entityName || c?.data?.name || 'Unknown theater';
+    const theater = c.entityName || c?.data?.name || c.name || c.cinemaName || c.label || 'Unknown theater';
     for (const s of c.sessions || []) {
       if (s.mcd && !movieMid) movieMid = s.mcd;
       const ist = utcToIST(s.showTime);

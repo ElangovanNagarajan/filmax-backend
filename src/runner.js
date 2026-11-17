@@ -49,6 +49,40 @@ function isNews(prior, patch) {
   return before !== after;                                    // shows appeared/vanished/changed
 }
 
+// Breakage alarm. BookMyShow and district.in redesign their pages without
+// notice; when that defeats the readers, checks fail or fall back to the text
+// reader, and the user should hear it from us — not discover it from a missed
+// booking. Telegram once a site has failed for FAIL_ALERT_MIN straight minutes
+// (a blip doesn't count), or has needed the backup reader at all. Each kind
+// repeats at most every REPEAT_HOURS. district.in's 403 from datacenter IPs is
+// a known, permanent condition (see check-core) and is not "breakage".
+const FAIL_ALERT_MIN = 45;
+const REPEAT_HOURS = 12;
+const failingSince = {};
+const lastAlarm = {};
+async function alarm(key, text) {
+  if (lastAlarm[key] && Date.now() - lastAlarm[key] < REPEAT_HOURS * 3600e3) return;
+  lastAlarm[key] = Date.now();
+  const ok = await sendAlert({ body: text });
+  console.log(`[runner] breakage alarm ${ok ? 'sent' : 'not sent'}: ${text}`);
+}
+async function trackHealth(siteHealth = {}) {
+  for (const [site, h] of Object.entries(siteHealth)) {
+    if (h.state === 'failed' && !/status code 403/i.test(h.reason || '')) {
+      failingSince[site] ||= Date.now();
+      const mins = Math.round((Date.now() - failingSince[site]) / 60000);
+      if (mins >= FAIL_ALERT_MIN) {
+        await alarm(`${site}:failed`, `⚠ 70 mm Filmax: ${site} checks have failed for ${mins} min — the site may have changed. Last error: ${String(h.reason).slice(0, 120)}`);
+      }
+    } else {
+      delete failingSince[site];
+    }
+    if (h.state === 'degraded') {
+      await alarm(`${site}:degraded`, `ℹ 70 mm Filmax: ${site} changed its page layout. Shows are still being found by the backup reader, but seat colours may be missing. (${String(h.reason).slice(0, 100)})`);
+    }
+  }
+}
+
 // Run a check pass. When `onlyIds` is given (a manual "check" / "check all"
 // request from the app), we check just those watches and ignore the master
 // OFF switch + enabled flag, since the user explicitly asked for it.
@@ -72,7 +106,8 @@ async function tickAll(onlyIds = null) {
     const prior = state[watch.id] || {};
     const merged = { ...watch, seenSids: prior.seenSids || watch.seenSids || [] };
     try {
-      const { patch, alert } = await checkWatch(merged);
+      const { patch, alert, siteHealth } = await checkWatch(merged);
+      await trackHealth(siteHealth).catch(() => {});
       const news = manual || checkAll || isNews(prior, patch);
       mergeState(state, watch.id, patch);
       // Publish THIS watch's result immediately when there's actually something

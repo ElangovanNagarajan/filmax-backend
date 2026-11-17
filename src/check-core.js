@@ -185,6 +185,15 @@ export async function checkWatch(watch) {
   }
 
   const multiTheater = (watch.theaters || []).length > 1;
+  // Per-site health for the runner's breakage alarm: did each site answer,
+  // fail to answer, or answer only through the backup text reader?
+  const siteHealth = {};
+  for (const { siteName, res } of results) {
+    siteHealth[siteName] = res.reason && isNonAnswer(res.reason)
+      ? { state: 'failed', reason: res.reason }
+      : res.degraded ? { state: 'degraded', reason: res.degraded } : { state: 'ok' };
+  }
+
   const allCurrent = fillMissingLabels(deduplicateSessions(rawSessions, multiTheater));
   // NOTE: `now` is only used for alert/lastSeen bookkeeping. `lastChecked` is
   // stamped at the very END of the pass (see below) — stamping it here would
@@ -250,7 +259,7 @@ export async function checkWatch(watch) {
       try {
         const url = await resolveBmsSeatUrl({
           city: s.bmsCinemaCity, slug: s.bmsCinemaSlug, cinemaCode: s.bmsCinemaCode,
-          date: s.date, time: s.time, movieHint: watch.movie,
+          date: s.date, time: s.time, movieHint: s.movieTitle || watch.movie,
         });
         if (url) s.resolvedSeatUrl = url;
       } catch { /* leave unresolved; app falls back to cinema date page */ }
@@ -302,5 +311,5 @@ export async function checkWatch(watch) {
   }
   if (allCurrent.length) patch.seenSids = (patch.seenSids || watch.seenSids || []).filter((sid) => currentSidSet.has(sid));
 
-  return { patch, alert };
+  return { patch, alert, siteHealth };
 }
