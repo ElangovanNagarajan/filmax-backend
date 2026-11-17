@@ -26,25 +26,21 @@ function isNetworkError(reason) {
   return NETWORK_ERROR_PATTERNS.some((p) => reason.toLowerCase().includes(p.toLowerCase()));
 }
 // Short and crisp — these show on a phone card. '' means "don't show".
+// Short and crisp — these show on a phone card. '' means "don't show".
 export function friendlyReason(reason, siteName) {
   if (!reason) return '';
   const site = { BookMyShow: 'BMS', 'district.in': 'District' }[siteName] || siteName;
   // district.in 403s every datacenter IP (see isNonAnswer); BookMyShow is the
   // real source from here, so the block is noise on the card.
   if (/status code 403/i.test(reason) || reason.includes('blocked')) return '';
-  if (isNetworkError(reason)) return `${site}: offline, retrying`;
   if (reason.includes('movie-not-listed')) return `${site}: movie not found`;
-  if (reason.startsWith('movie-not-at-theater')) {
-    const titles = reason.split(':').slice(1).join(':').split(',').map((t) => t.trim()).filter(Boolean).slice(0, 3);
-    return `${site}: not playing${titles.length ? ` (now: ${titles.join(', ')})` : ''}`;
-  }
+  if (reason.startsWith('movie-not-at-theater')) return `${site}: not playing here`;
   if (reason.includes('no-cinema-resolved')) {
     const names = reason.split('no-cinema-resolved:')[1]?.trim();
-    return `${site}: no shows at ${names || 'theater'} yet`;
+    return `${site}: ${names ? `${names} ` : ''}not found`;
   }
-  if (reason.startsWith('could-not-read')) return `${site}: didn't load, retrying`;
-  if (/status code 429/i.test(reason)) return `${site}: busy, retrying`;
-  return `${site}: error, retrying`;
+  // Network, half-loaded page, rate limit, anything else: it retries itself.
+  return `${site}: retrying`;
 }
 
 // "We couldn't look" vs "we looked and it isn't there". Only the first is a
